@@ -2,7 +2,7 @@ import argparse
 import json
 import sys
 
-from .client import RokuSmartHome, SessionExpired, UnsupportedCommand, DeviceNotFound
+from .client import RokuSmartHome, SessionExpired, RokuUnavailable, UnsupportedCommand, DeviceNotFound
 
 
 def main(argv=None):
@@ -81,6 +81,8 @@ def main(argv=None):
 
     except SessionExpired as e:
         sys.exit(f"SESSION EXPIRED: {e}")
+    except RokuUnavailable as e:
+        sys.exit(f"ROKU UNAVAILABLE: {e}")
     except (DeviceNotFound, UnsupportedCommand, ValueError) as e:
         sys.exit(f"Error: {e}")
 
