@@ -4,19 +4,18 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "roku-smarthome"
-version = "0.1.0"
+version = "0.2.0"
 description = "Unofficial Python client for Roku Smart Home plugs, bulbs and cameras (status and control)."
 readme = "README.md"
-license = { text = "MIT" }
+license = "MIT"
 requires-python = ">=3.9"
 authors = [{ name = "addition-official" }]
 keywords = ["roku", "smart home", "smart plug", "wyze", "home automation"]
 classifiers = [
   "Programming Language :: Python :: 3",
-  "License :: OSI Approved :: MIT License",
   "Topic :: Home Automation",
 ]
-dependencies = ["requests>=2.28", "websockets>=12"]
+dependencies = ["requests>=2.28", "websockets>=13"]
 
 [project.urls]
 Homepage = "https://github.com/addition-official/roku-smarthome"
