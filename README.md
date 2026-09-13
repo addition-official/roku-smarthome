@@ -1,4 +1,4 @@
-[![PyPI](https://img.shields.io/pypi/v/roku-smarthome?cacheSeconds=300)](https://pypi.org/project/roku-smarthome/)
+[![PyPI](https://img.shields.io/pypi/v/roku-smarthome?label=pypi&cacheSeconds=300)](https://pypi.org/project/roku-smarthome/)
 
 # roku-smarthome
 
