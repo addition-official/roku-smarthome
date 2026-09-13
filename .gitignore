@@ -1,0 +1,9 @@
+cookies.json
+roku_cookies.json
+roku_creds.json
+__pycache__/
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
