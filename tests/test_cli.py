@@ -51,3 +51,10 @@ def test_connection_errors_are_reported(use_client, error, label):
     with pytest.raises(SystemExit) as exc:
         cli.main(["status"])
     assert label in str(exc.value.code)
+
+
+def test_temp_out_of_range_is_rejected(use_client):
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["temp", "Bedroom Bulb", "30000"])
+    assert "1800..6500" in str(exc.value.code)
+    assert use_client.sent == []

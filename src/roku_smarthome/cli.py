@@ -27,7 +27,7 @@ def main(argv=None):
 
     sp = sub.add_parser("temp", help="set white color temperature")
     sp.add_argument("device")
-    sp.add_argument("kelvin", type=int, help="e.g. 2700-6500")
+    sp.add_argument("kelvin", type=int, help="1800-6500 (white bulbs: 2700-6500)")
 
     sp = sub.add_parser("rgb", help="set RGB color (color bulbs only)")
     sp.add_argument("device")
@@ -85,7 +85,9 @@ def main(argv=None):
         sys.exit(f"ROKU UNAVAILABLE: {e}")
     except (DeviceNotFound, UnsupportedCommand, ValueError) as e:
         sys.exit(f"Error: {e}")
+    finally:
+        rk.close()
 
 
 if __name__ == "__main__":
-    main()
+    main()

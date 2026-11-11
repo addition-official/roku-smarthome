@@ -11,16 +11,22 @@ client is used at least once a year the login never expires.
 """
 
 import asyncio
+import atexit
 import json
 import os
 import threading
 import time
 import uuid
+import weakref
 from pathlib import Path
 from typing import Dict, List, Optional
 import concurrent.futures
 import requests
-import websockets
+import websockets.exceptions
+# The new asyncio client. On websockets 13 the top-level websockets.connect
+# is still the legacy client, which does not accept additional_headers.
+from websockets.asyncio.client import connect as ws_connect
+from websockets.protocol import State
 
 LEAVES_URL = "https://my.roku.com/smarthome/api/v1/leaves"
 SOCKET_URL = "wss://aspen-sockets.aspen.msc.roku.com/v1/socket"
@@ -37,6 +43,11 @@ _SKIP = {
     "__cf_bm", "_cflb", "_csrf", "_uc", "_usn", "amoeba", "BVBRANDID",
     "ks.locale", "ks.privacy.ccpa", "x-amz-continuous-deployment-state",
 }
+
+# White color temperature range accepted by set_color_temp. The tested white
+# bulb does 2700-6500K; the color bulbs in this hardware family go down to 1800K.
+COLOR_TEMP_MIN = 1800
+COLOR_TEMP_MAX = 6500
 
 _UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
        "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
@@ -127,6 +138,9 @@ class Device:
         self.brightness = int(level)
 
     def set_color_temp(self, kelvin: int):
+        if not COLOR_TEMP_MIN <= kelvin <= COLOR_TEMP_MAX:
+            raise ValueError(
+                f"color temperature must be {COLOR_TEMP_MIN}..{COLOR_TEMP_MAX} K")
         self.send("color", {"colorType": "temperature", "temperature": int(kelvin)})
         self.color_temp = int(kelvin)
         self.color_type = "temperature"
@@ -150,17 +164,30 @@ class RokuSmartHome:
     cache_ttl     default max age (seconds) for the device list. 0 = always fetch.
                   A hub polling from several threads should set this to a few seconds
                   so they all share one request.
-    command_wait  seconds to keep the websocket open after sending a command, so the
-                  server has time to flush it. 0.5 is plenty in practice.
+    persistent    keep one websocket open and reuse it for every command (default).
+                  Much faster when sending several commands in a row. If the
+                  connection has dropped, it reconnects and resends once.
+                  False opens a new connection per command (the pre-0.2.3 behavior).
+    idle_timeout  with persistent=True, close the websocket after this many seconds
+                  without a command; the next command reopens it. 0 = never.
+    command_wait  with persistent=False, seconds to keep the websocket open after
+                  sending a command so the server has time to flush it.
+
+    Call close() (or use `with RokuSmartHome() as rk:`) when you are done. It is
+    also called automatically when the interpreter exits.
     """
 
     def __init__(self, cookie_file: Optional[os.PathLike] = None, *,
                  timeout: float = 10.0, cache_ttl: float = 0.0,
-                 command_wait: float = 0.5):
+                 command_wait: float = 0.5, persistent: bool = True,
+                 idle_timeout: float = 60.0):
         self.cookie_file = Path(cookie_file) if cookie_file else DEFAULT_COOKIE_FILE
         self.timeout = float(timeout)
         self.cache_ttl = float(cache_ttl)
         self.command_wait = float(command_wait)
+        self.persistent = bool(persistent)
+        self.idle_timeout = float(idle_timeout)
+        self.socket_url = SOCKET_URL
 
         self._cache_lock = threading.Lock()
         self._cache_raw: Optional[List[dict]] = None
@@ -168,6 +195,14 @@ class RokuSmartHome:
 
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._loop_lock = threading.Lock()
+
+        # persistent websocket state; only touched from the event loop thread
+        self._ws = None
+        self._ws_lock: Optional[asyncio.Lock] = None
+        self._idle_handle: Optional[asyncio.TimerHandle] = None
+        self._connects = 0  # connections opened, for tests and debugging
+
+        atexit.register(_close_at_exit, weakref.ref(self))
 
         self._load_session()
 
@@ -324,28 +359,22 @@ class RokuSmartHome:
                 "command": {"command": command, "parameters": parameters},
             },
         }
-        w = self.command_wait if wait is None else float(wait)
-        self._run(self._ws_send(msg, w), timeout=self.timeout + w + 2)
+        if self.persistent:
+            # worst case: a send on a dead connection, then a fresh connect
+            self._run(self._ws_send_persistent(msg), timeout=2 * self.timeout + 2)
+        else:
+            w = self.command_wait if wait is None else float(wait)
+            self._run(self._ws_send_once(msg, w), timeout=self.timeout + w + 2)
         # state changed on Roku's side; don't serve the stale list again
         self.invalidate()
 
-    async def _ws_send(self, msg: dict, wait: float):
+    # ----- websocket plumbing (runs on the event loop thread) -----
+
+    async def _ws_open(self):
         headers = {"Cookie": self._cookie_header(), "Origin": ORIGIN}
         try:
-            async with websockets.connect(SOCKET_URL, additional_headers=headers,
-                                          open_timeout=self.timeout) as ws:
-                await ws.send(json.dumps(msg))
-                # Server chats on connect (init / stream_init / leaves). Give it a
-                # moment so the command is flushed before we close, then leave.
-                deadline = asyncio.get_running_loop().time() + wait
-                while True:
-                    remaining = deadline - asyncio.get_running_loop().time()
-                    if remaining <= 0:
-                        break
-                    try:
-                        await asyncio.wait_for(ws.recv(), timeout=remaining)
-                    except asyncio.TimeoutError:
-                        break
+            ws = await ws_connect(self.socket_url, additional_headers=headers,
+                                  open_timeout=self.timeout)
         except websockets.exceptions.InvalidStatus as e:
             code = getattr(getattr(e, "response", None), "status_code", None)
             if code in (401, 403):
@@ -356,3 +385,111 @@ class RokuSmartHome:
             raise RokuUnavailable(f"websocket handshake failed (HTTP {code})") from e
         except (OSError, asyncio.TimeoutError, websockets.exceptions.WebSocketException) as e:
             raise RokuUnavailable(f"websocket error: {e}") from e
+        self._connects += 1
+        return ws
+
+    async def _ws_send_once(self, msg: dict, wait: float):
+        """Open a connection, send one command, linger `wait` seconds, close."""
+        ws = await self._ws_open()
+        try:
+            await ws.send(json.dumps(msg))
+            # Server chats on connect (init / stream_init / leaves). Give it a
+            # moment so the command is flushed before we close, then leave.
+            deadline = asyncio.get_running_loop().time() + wait
+            while True:
+                remaining = deadline - asyncio.get_running_loop().time()
+                if remaining <= 0:
+                    break
+                try:
+                    await asyncio.wait_for(ws.recv(), timeout=remaining)
+                except asyncio.TimeoutError:
+                    break
+        except (OSError, websockets.exceptions.WebSocketException) as e:
+            raise RokuUnavailable(f"websocket error: {e}") from e
+        finally:
+            await ws.close()
+
+    def _lock(self) -> asyncio.Lock:
+        if self._ws_lock is None:
+            self._ws_lock = asyncio.Lock()
+        return self._ws_lock
+
+    async def _ws_send_persistent(self, msg: dict):
+        """Send over the shared connection, opening it if needed. If the
+        connection turns out to be dead, reconnect and resend once."""
+        data = json.dumps(msg)
+        async with self._lock():
+            for attempt in (1, 2):
+                fresh = self._ws is None or self._ws.state is not State.OPEN
+                if fresh:
+                    await self._ws_drop()
+                    self._ws = await self._ws_open()
+                    asyncio.get_running_loop().create_task(self._ws_reader(self._ws))
+                try:
+                    await self._ws.send(data)
+                    break
+                except (OSError, websockets.exceptions.ConnectionClosed) as e:
+                    await self._ws_drop()
+                    if fresh or attempt == 2:
+                        raise RokuUnavailable(f"websocket error: {e}") from e
+            self._arm_idle_timer()
+
+    async def _ws_reader(self, ws):
+        # Keep reading so the server's chatter can't fill the receive buffer;
+        # a full buffer stops ping/pong processing and the connection dies.
+        try:
+            async for _ in ws:
+                pass
+        except Exception:
+            pass
+        if self._ws is ws:
+            self._ws = None
+
+    def _arm_idle_timer(self):
+        if self._idle_handle is not None:
+            self._idle_handle.cancel()
+            self._idle_handle = None
+        if self.idle_timeout > 0:
+            loop = asyncio.get_running_loop()
+            self._idle_handle = loop.call_later(
+                self.idle_timeout, lambda: loop.create_task(self._ws_close_locked()))
+
+    async def _ws_drop(self):
+        ws, self._ws = self._ws, None
+        if ws is not None:
+            try:
+                await asyncio.wait_for(ws.close(), timeout=self.timeout)
+            except Exception:
+                pass
+
+    async def _ws_close_locked(self):
+        async with self._lock():
+            if self._idle_handle is not None:
+                self._idle_handle.cancel()
+                self._idle_handle = None
+            await self._ws_drop()
+
+    # ----- cleanup -----
+
+    def close(self):
+        """Close the shared websocket, flushing anything still being sent.
+        Safe to call more than once; the next command reopens it."""
+        loop = self._loop
+        if loop is None or loop.is_closed() or not loop.is_running():
+            return
+        try:
+            self._run(self._ws_close_locked(), timeout=self.timeout + 2)
+        except Exception:
+            pass
+
+    def __enter__(self) -> "RokuSmartHome":
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+
+def _close_at_exit(ref):
+    client = ref()
+    if client is not None:
+        client.close()

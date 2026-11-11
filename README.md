@@ -14,7 +14,7 @@ Developed and tested against the **Roku Indoor Smart Plug SE (PS1000X)** and the
 
 - List every device on your Roku Smart Home account with its state: power, online, brightness, color temperature
 - Turn plugs and bulbs on and off
-- Set bulb brightness (0 to 100) and white color temperature (2700K to 6500K on the tested bulb)
+- Set bulb brightness (0 to 100) and white color temperature (2700K to 6500K on the tested bulb; values outside 1800K to 6500K are rejected)
 - Set RGB color on color bulbs (confirmed working by a user with a color bulb, see [#1](https://github.com/addition-official/roku-smarthome/issues/1))
 - Send any other command a device advertises, via a generic escape hatch
 - Keep itself logged in: Roku renews the session on every request and this client saves the renewed cookie, so the login never expires as long as you use it at least once a year
@@ -62,7 +62,7 @@ roku-smarthome on "Living room lamp"
 roku-smarthome off "Living room lamp"
 roku-smarthome toggle "Living room lamp"
 roku-smarthome brightness "Bedroom bulb" 40             # 0-100
-roku-smarthome temp "Bedroom bulb" 3000                 # Kelvin
+roku-smarthome temp "Bedroom bulb" 3000                 # Kelvin, 1800-6500
 roku-smarthome rgb "Color bulb" 255 80 0                # color bulbs only
 roku-smarthome json                                     # raw device list, for piping elsewhere
 roku-smarthome --cookies PATH status                    # use a different cookie file
@@ -98,6 +98,21 @@ bulb.send("color", {"colorType": "temperature", "temperature": 4000})
 
 `Device` attributes: `id`, `name`, `type` (`plug`, `light`, `camera`), `model`, `local_ip`, `power` (`"on"`/`"off"`), `online`, `brightness`, `color_temp`, `color_type`, `color_rgb`, `supported_commands`, and `raw` (the untouched JSON).
 
+### Sending many commands quickly
+
+The client keeps one connection to Roku open and reuses it, so commands sent in a row (a brightness slider, a scene that changes several bulbs) go out almost instantly instead of each opening a new connection. If the connection has dropped, the next command reconnects and resends automatically. The connection closes by itself after 60 seconds without a command (`idle_timeout`).
+
+Close it when you're done, or use a `with` block. It is also closed automatically when your script exits.
+
+```python
+with RokuSmartHome() as rk:
+    bulb = rk.get("Bedroom bulb")
+    for level in range(0, 101, 10):
+        bulb.set_brightness(level)
+```
+
+Pass `persistent=False` to go back to one connection per command (the behavior before 0.2.3).
+
 Exceptions: `SessionExpired` (saved cookie no longer works; run `login` again), `RokuUnavailable` (Roku's API unreachable or erroring; retry later), `DeviceNotFound`, and `UnsupportedCommand` (raised instead of silently sending a command the device doesn't list).
 
 ## Keeping it logged in
@@ -127,6 +142,7 @@ The Roku Smart Home line is Wyze hardware sold under the Roku brand, but the dev
 - **Cameras** are listed with name and online state only. Streams, events and settings are visible in the API but not implemented here.
 - **RGB color** was implemented from Roku's web app without a color bulb to test on, and has since been confirmed working by a user ([#1](https://github.com/addition-official/roku-smarthome/issues/1)). The parameter shape is `{"colorType": "rgb", "rgb": [r, g, b]}`, each 0 to 255.
 - Commands are fire-and-forget over the websocket. Call `refresh()` if you need to confirm the new state.
+- The shared connection is only tested against a local fake server so far, not real Roku hardware. If commands start failing after a period of inactivity, try `persistent=False` and please open an issue.
 
 ## Project layout
 

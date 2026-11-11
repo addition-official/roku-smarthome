@@ -113,3 +113,14 @@ def test_no_cache_by_default(client):
     client.devices()
     client.devices()
     assert client.fetch_count == 2
+
+
+def test_color_temp_validation(client):
+    bulb = client.get("Bedroom Bulb")
+    bulb.set_color_temp(1800)
+    bulb.set_color_temp(6500)
+    for bad in (1799, 6501, 30000, 0):
+        with pytest.raises(ValueError):
+            bulb.set_color_temp(bad)
+    assert len(client.sent) == 2
+    assert bulb.color_temp == 6500

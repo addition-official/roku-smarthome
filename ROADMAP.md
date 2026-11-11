@@ -13,13 +13,15 @@ pip install . pytest
 python -m pytest
 ```
 
-### 2. Reuse one connection for commands
+### 2. Reuse one connection for commands - done (needs hardware testing)
 
-Every command opens a new websocket to Roku, sends one message, waits half a second (`command_wait`) and closes. That's fine for a single `on`, but slow for anything that sends many commands in a row, like a GUI brightness slider. Keeping one connection open on the background event loop and reconnecting when it drops would make the library much faster for apps. This is the biggest improvement to the library itself.
+The client now keeps one websocket open and reuses it (`persistent=True`, the default). A background reader keeps the connection healthy, it reconnects and resends once if the connection has dropped, and it closes after `idle_timeout` seconds without a command (60 by default) and at interpreter exit. `persistent=False` restores the old one-connection-per-command behavior. Covered by `tests/test_websocket.py` against a local fake server.
 
-### 3. Check color temperature values
+Still to check on real devices: that Roku accepts several commands on one connection, and how long it keeps an idle connection open.
 
-`set_brightness` and `set_color_rgb` reject out-of-range values, but `set_color_temp` sends any number. A typo like `temp lamp 30000` goes straight to Roku. It should reject values outside the bulb's range (2700-6500K on the tested bulb; check whether the device reports its own range in `supportedCommands`).
+### 3. Check color temperature values - done
+
+`set_color_temp` rejects values outside 1800-6500K (`COLOR_TEMP_MIN` / `COLOR_TEMP_MAX` in `client.py`). 1800K is the low end of the color bulbs in this hardware family; the tested white bulb does 2700-6500K. If Roku's device data turns out to include each bulb's own range, use that instead.
 
 ### 4. Make the CLI nicer to use
 
