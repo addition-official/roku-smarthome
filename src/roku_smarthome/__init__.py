@@ -4,6 +4,7 @@ from .client import (
     SessionExpired,
     UnsupportedCommand,
     DeviceNotFound,
+    RokuUnavailable,
 )
 
 __all__ = [
@@ -14,4 +15,4 @@ __all__ = [
     "DeviceNotFound",
     "RokuUnavailable",
 ]
-__version__ = "0.2.0"
+__version__ = "0.2.2"

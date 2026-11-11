@@ -16,7 +16,6 @@ import os
 import threading
 import time
 import uuid
-from http.cookies import SimpleCookie
 from pathlib import Path
 from typing import Dict, List, Optional
 import concurrent.futures
@@ -196,10 +195,19 @@ class RokuSmartHome:
             pass
 
     def import_cookie_header(self, header: str) -> int:
-        """Store a raw `Cookie:` header value copied from the browser. Returns cookie count."""
-        sc = SimpleCookie()
-        sc.load(header)
-        self._cookies = {k: m.value for k, m in sc.items()}
+        """Store a raw `Cookie:` header value copied from the browser. Returns cookie count.
+        Parsed by hand: SimpleCookie silently returns nothing if the header contains a
+        bare token without '=' (browsers do emit these, e.g. 'roku_test;')."""
+        cookies: Dict[str, str] = {}
+        for part in header.split(";"):
+            part = part.strip()
+            if not part or "=" not in part:
+                continue
+            k, v = part.split("=", 1)
+            k, v = k.strip(), v.strip()
+            if k:
+                cookies[k] = v
+        self._cookies = cookies
         self._write_cookie_file()
         self._load_session()
         self.invalidate()

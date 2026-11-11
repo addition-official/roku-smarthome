@@ -15,7 +15,7 @@ Developed and tested against the **Roku Indoor Smart Plug SE (PS1000X)** and the
 - List every device on your Roku Smart Home account with its state: power, online, brightness, color temperature
 - Turn plugs and bulbs on and off
 - Set bulb brightness (0 to 100) and white color temperature (2700K to 6500K on the tested bulb)
-- Set RGB color on color bulbs (implemented from Roku's web app, untested on hardware; see notes)
+- Set RGB color on color bulbs (confirmed working by a user with a color bulb, see [#1](https://github.com/addition-official/roku-smarthome/issues/1))
 - Send any other command a device advertises, via a generic escape hatch
 - Keep itself logged in: Roku renews the session on every request and this client saves the renewed cookie, so the login never expires as long as you use it at least once a year
 
@@ -63,7 +63,7 @@ roku-smarthome off "Living room lamp"
 roku-smarthome toggle "Living room lamp"
 roku-smarthome brightness "Bedroom bulb" 40             # 0-100
 roku-smarthome temp "Bedroom bulb" 3000                 # Kelvin
-roku-smarthome rgb "Color bulb" 255 80 0                # color bulbs only, untested
+roku-smarthome rgb "Color bulb" 255 80 0                # color bulbs only
 roku-smarthome json                                     # raw device list, for piping elsewhere
 roku-smarthome --cookies PATH status                    # use a different cookie file
 ```
@@ -88,7 +88,7 @@ print(lamp.is_on)
 bulb = rk.get("Bedroom bulb")
 bulb.set_brightness(40)
 bulb.set_color_temp(3000)
-bulb.set_color_rgb(255, 80, 0)       # color bulbs only, untested
+bulb.set_color_rgb(255, 80, 0)       # color bulbs only
 bulb.refresh()                       # re-fetch state from Roku
 print(bulb.brightness, bulb.color_temp)
 
@@ -98,7 +98,7 @@ bulb.send("color", {"colorType": "temperature", "temperature": 4000})
 
 `Device` attributes: `id`, `name`, `type` (`plug`, `light`, `camera`), `model`, `local_ip`, `power` (`"on"`/`"off"`), `online`, `brightness`, `color_temp`, `color_type`, `color_rgb`, `supported_commands`, and `raw` (the untouched JSON).
 
-Exceptions: `SessionExpired` (saved cookie no longer works; run `login` again), `DeviceNotFound`, and `UnsupportedCommand` (raised instead of silently sending a command the device doesn't list).
+Exceptions: `SessionExpired` (saved cookie no longer works; run `login` again), `RokuUnavailable` (Roku's API unreachable or erroring; retry later), `DeviceNotFound`, and `UnsupportedCommand` (raised instead of silently sending a command the device doesn't list).
 
 ## Keeping it logged in
 
@@ -125,7 +125,7 @@ The Roku Smart Home line is Wyze hardware sold under the Roku brand, but the dev
 - **Cloud only.** The plugs have a local API on port 88 but it's encrypted with a key that only the Roku/Wyze login flow hands out. Local control would mean flashing ESPHome or Tasmota onto the ESP32 inside, which requires opening the device.
 - **Unofficial.** Roku could change or remove these endpoints at any time. If `status` starts failing with something other than `SESSION EXPIRED`, that's probably what happened; please open an issue with the error (and the cookie value removed).
 - **Cameras** are listed with name and online state only. Streams, events and settings are visible in the API but not implemented here.
-- **RGB color is implemented but untested.** I don't own a color bulb. The parameter shape (`{"colorType": "rgb", "rgb": [r, g, b]}`, each 0 to 255) is taken directly from Roku's web app, so it should work. If you have a color bulb, please confirm in an issue either way.
+- **RGB color** was implemented from Roku's web app without a color bulb to test on, and has since been confirmed working by a user ([#1](https://github.com/addition-official/roku-smarthome/issues/1)). The parameter shape is `{"colorType": "rgb", "rgb": [r, g, b]}`, each 0 to 255.
 - Commands are fire-and-forget over the websocket. Call `refresh()` if you need to confirm the new state.
 
 ## Project layout
