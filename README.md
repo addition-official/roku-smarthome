@@ -136,6 +136,8 @@ src/roku_smarthome/
     client.py         the library: cookie handling, device list, commands
     cli.py            the command line
 pyproject.toml        packaging / build config
+tests/                test suite (pip install . pytest; python -m pytest)
+ROADMAP.md            planned improvements
 LICENSE               MIT
 ```
 
