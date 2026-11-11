@@ -27,7 +27,7 @@ Or clone this repo and `pip install .` to build the exact package that's publish
 
 ## Requirements
 
-- Python 3.9+
+- Python 3.10+
 - `requests` and `websockets` (installed automatically by pip)
 
 ## Setup
