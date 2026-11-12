@@ -160,6 +160,7 @@ src/roku_smarthome/
 pyproject.toml        packaging / build config
 tests/                test suite (pip install . pytest; python -m pytest)
 ROADMAP.md            planned improvements
+CHANGELOG.md          what changed in each release
 LICENSE               MIT
 ```
 
