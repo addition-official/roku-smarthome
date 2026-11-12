@@ -168,7 +168,7 @@ The Roku Smart Home line is Wyze hardware sold under the Roku brand, but the dev
 - **RGB color** was implemented from Roku's web app without a color bulb to test on, and has since been confirmed working by a user ([#1](https://github.com/addition-official/roku-smarthome/issues/1)). The parameter shape is `{"colorType": "rgb", "rgb": [r, g, b]}`, each 0 to 255.
 - A command Roku confirms has been accepted by Roku's cloud; the device itself acts a moment later. Call `refresh()` if you need to see the new state.
 - `toggle()` flips based on the state the `Device` object last saw. If something else may have changed the device, call `refresh()` first.
-- The shared connection is only tested against a local fake server so far, not real Roku hardware. If commands start failing after a period of inactivity, try `persistent=False` and please open an issue.
+- The shared connection and live updates are tested on a real plug (PS1000X), including changes made through Google Assistant. Bulbs haven't been tested with them yet. If commands start failing after a period of inactivity, try `persistent=False` and please open an issue.
 
 ## Project layout
 
