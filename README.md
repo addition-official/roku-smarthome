@@ -117,7 +117,7 @@ with RokuSmartHome() as rk:
         bulb.set_brightness(level)
 ```
 
-Pass `persistent=False` to go back to one connection per command (the behavior before 0.2.3).
+Pass `persistent=False` to go back to one connection per command (the behavior before 0.3.0).
 
 ### Live updates
 

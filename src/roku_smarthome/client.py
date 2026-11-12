@@ -245,7 +245,7 @@ class RokuSmartHome:
     persistent    keep one websocket open and reuse it for every command (default).
                   Much faster when sending several commands in a row. If the
                   connection has dropped, it reconnects and resends once.
-                  False opens a new connection per command (the pre-0.2.3 behavior).
+                  False opens a new connection per command (the pre-0.3.0 behavior).
     idle_timeout  with persistent=True, close the websocket after this many seconds
                   without a command; the next command reopens it. 0 = never.
     confirm       wait for Roku's reply to each command and raise CommandFailed if

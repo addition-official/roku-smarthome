@@ -6,7 +6,7 @@ What changed in each release on [PyPI](https://pypi.org/project/roku-smarthome/)
 
 Nothing yet.
 
-## 0.2.3
+## 0.3.0
 
 ### Added
 - Commands reuse one connection to Roku, so several in a row go out almost instantly. The connection closes after 60 seconds without a command, on `close()`, at the end of a `with` block, and when the program exits. `persistent=False` restores one connection per command.
