@@ -64,11 +64,16 @@ roku-smarthome toggle "Living room lamp"
 roku-smarthome brightness "Bedroom bulb" 40             # 0-100
 roku-smarthome temp "Bedroom bulb" 3000                 # Kelvin, 1800-6500
 roku-smarthome rgb "Color bulb" 255 80 0                # color bulbs only
+roku-smarthome rgb "Color bulb" "#ff5000"               # same, as a hex color
 roku-smarthome json                                     # raw device list, for piping elsewhere
 roku-smarthome --cookies PATH status                    # use a different cookie file
 ```
 
-Device names are matched case-insensitively against the names in the Roku Smart Home app.
+Device names are matched case-insensitively against the names in the Roku Smart Home app, and you can shorten them to any part that only one device has: `roku-smarthome on porch` works for "Porch Camera". If a short name matches several devices, the error lists them.
+
+Exit codes, for scripts and cron jobs: `0` OK, `1` error (unknown device, bad value, unsupported command), `2` bad arguments, `3` session expired (run `login` again), `4` Roku unreachable (retry later).
+
+In Python, `rk.find("porch")` does the same forgiving lookup; `rk.get(name)` still requires the exact name.
 
 ## Use it as a library
 

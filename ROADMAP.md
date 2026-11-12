@@ -23,11 +23,11 @@ Still to check on real devices: that Roku accepts several commands on one connec
 
 `set_color_temp` rejects values outside 1800-6500K (`COLOR_TEMP_MIN` / `COLOR_TEMP_MAX` in `client.py`). 1800K is the low end of the color bulbs in this hardware family; the tested white bulb does 2700-6500K. If Roku's device data turns out to include each bulb's own range, use that instead.
 
-### 4. Make the CLI nicer to use
+### 4. Make the CLI nicer to use - done
 
-- Partial name matching, so `on lamp` works when only one device has "lamp" in its name (and a clear error listing matches when several do).
-- Hex colors, like `rgb "Color bulb" #ff8000`.
-- Different exit codes for "session expired" and "Roku is down", so scripts and cron jobs can tell them apart. Right now every error exits with code 1.
+- Partial name matching: `on porch` works when only one device has "porch" in its name; ambiguous names list the matches. Also available in Python as `rk.find()`.
+- Hex colors: `rgb "Color bulb" "#ff8000"` (or `#f80`), alongside three numbers.
+- Distinct exit codes: 1 error, 2 bad arguments, 3 session expired, 4 Roku unavailable.
 
 ## Bigger features
 

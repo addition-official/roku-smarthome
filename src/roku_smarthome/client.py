@@ -326,6 +326,23 @@ class RokuSmartHome:
                 return d
         raise DeviceNotFound(name_or_id)
 
+    def find(self, query: str, max_age: Optional[float] = None) -> Device:
+        """Forgiving lookup for people typing names: an exact name (any case),
+        then a device id, then any device whose name contains `query`, as long
+        as only one does. Raises DeviceNotFound listing the candidates."""
+        devices = self.devices(max_age)
+        q = query.strip().lower()
+        for match in ([d for d in devices if d.name.lower() == q],
+                      [d for d in devices if d.id == query],
+                      [d for d in devices if q and q in d.name.lower()]):
+            if len(match) == 1:
+                return match[0]
+            if len(match) > 1:
+                names = ", ".join(repr(d.name) for d in match)
+                raise DeviceNotFound(f"{query!r} matches several devices: {names}")
+        names = ", ".join(repr(d.name) for d in devices) or "none"
+        raise DeviceNotFound(f"no device matches {query!r} (devices: {names})")
+
     # ----- websocket loop (one daemon thread, safe to call from anywhere) -----
 
     def _get_loop(self) -> asyncio.AbstractEventLoop:
