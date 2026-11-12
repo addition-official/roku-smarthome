@@ -11,6 +11,7 @@ from websockets.asyncio.server import serve
 from websockets.exceptions import ConnectionClosedError
 from websockets.datastructures import Headers
 from websockets.http11 import Response
+from websockets.protocol import State
 
 from roku_smarthome import Device, RokuSmartHome, RokuUnavailable, SessionExpired
 
@@ -22,12 +23,17 @@ class FakeRoku:
 
     reject_with   HTTP status to refuse the handshake with (e.g. 403)
     chatter       messages to send to each new client, like Roku's init burst
+    process_delay like real Roku, a command only takes effect (lands in
+                  `processed`) if the connection is still open this long after
+                  it arrives; closing right after sending loses it
     """
 
     def __init__(self):
         self.reject_with = None
         self.chatter = 0
         self.received = []
+        self.processed = []
+        self.process_delay = 0.3
         self.connections = 0
         self.headers = []
         self._clients = set()
@@ -60,9 +66,22 @@ class FakeRoku:
             for i in range(self.chatter):
                 await ws.send(json.dumps({"type": "init", "n": i}))
             async for message in ws:
-                self.received.append(json.loads(message))
+                msg = json.loads(message)
+                self.received.append(msg)
+                asyncio.get_running_loop().create_task(self._process(ws, msg))
         finally:
             self._clients.discard(ws)
+
+    async def _process(self, ws, msg):
+        await asyncio.sleep(self.process_delay)
+        if ws.state is State.OPEN:
+            self.processed.append(msg)
+
+    def wait_for_processed(self, n, timeout=5):
+        deadline = time.monotonic() + timeout
+        while len(self.processed) < n and time.monotonic() < deadline:
+            time.sleep(0.01)
+        return self.processed
 
     def drop_all_connections(self):
         """Close every client connection from the server side."""
@@ -292,5 +311,45 @@ def test_command_is_delivered_when_script_exits_immediately(server, cookie_file)
         Device(rk, make_leaf()).turn_on()
     """)
     subprocess.run([sys.executable, "-c", script], check=True, timeout=30)
-    msgs = server.wait_for_messages(1)
+    msgs = server.wait_for_processed(1)
     assert msgs and msgs[0]["payload"]["command"]["parameters"] == {"power": "on"}
+
+
+def test_close_right_after_command_still_processed(make_client, server):
+    # What the CLI does: one command, then close() straight away.
+    # Roku drops a command if the connection closes too soon after it.
+    rk, bulb = make_client()
+    bulb.turn_on()
+    rk.close()
+    assert len(server.wait_for_processed(1)) == 1
+
+
+def test_last_of_a_burst_is_processed_before_close(make_client, server):
+    # The failed hardware test: off, 1 s, on, then exit. The "on" was lost.
+    rk, bulb = make_client()
+    bulb.turn_off()
+    time.sleep(0.5)
+    bulb.turn_on()
+    rk.close()
+    msgs = server.wait_for_processed(2)
+    assert [m["payload"]["command"]["parameters"] for m in msgs] == [
+        {"power": "off"}, {"power": "on"}]
+
+
+def test_idle_close_does_not_cut_off_last_command(make_client, server):
+    rk, bulb = make_client(idle_timeout=0.05)
+    bulb.turn_on()
+    time.sleep(1)
+    assert rk._ws is None
+    assert len(server.wait_for_processed(1)) == 1
+
+
+def test_cli_command_is_processed(server, cookie_file, monkeypatch):
+    from roku_smarthome import cli
+    rk = RokuSmartHome(cookie_file, timeout=3)
+    rk.import_cookie_header("ks.session=abc")
+    rk.socket_url = server.url
+    rk._fetch_leaves = lambda: [make_leaf()]
+    monkeypatch.setattr(cli, "RokuSmartHome", lambda cookies=None: rk)
+    cli.main(["on", "bedroom"])
+    assert len(server.wait_for_processed(1)) == 1

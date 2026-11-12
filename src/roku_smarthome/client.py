@@ -170,8 +170,9 @@ class RokuSmartHome:
                   False opens a new connection per command (the pre-0.2.3 behavior).
     idle_timeout  with persistent=True, close the websocket after this many seconds
                   without a command; the next command reopens it. 0 = never.
-    command_wait  with persistent=False, seconds to keep the websocket open after
-                  sending a command so the server has time to flush it.
+    command_wait  seconds a connection must stay open after the last command
+                  before it is closed. Roku drops a command if the connection
+                  closes right after it, so keep this around 0.5.
 
     Call close() (or use `with RokuSmartHome() as rk:`) when you are done. It is
     also called automatically when the interpreter exits.
@@ -201,6 +202,7 @@ class RokuSmartHome:
         self._ws_lock: Optional[asyncio.Lock] = None
         self._idle_handle: Optional[asyncio.TimerHandle] = None
         self._connects = 0  # connections opened, for tests and debugging
+        self._last_send = 0.0  # loop time of the last command on self._ws
 
         atexit.register(_close_at_exit, weakref.ref(self))
 
@@ -444,6 +446,7 @@ class RokuSmartHome:
                     asyncio.get_running_loop().create_task(self._ws_reader(self._ws))
                 try:
                     await self._ws.send(data)
+                    self._last_send = asyncio.get_running_loop().time()
                     break
                 except (OSError, websockets.exceptions.ConnectionClosed) as e:
                     await self._ws_drop()
@@ -484,6 +487,12 @@ class RokuSmartHome:
             if self._idle_handle is not None:
                 self._idle_handle.cancel()
                 self._idle_handle = None
+            if self._ws is not None:
+                # Roku drops a command if the connection closes right after
+                # it, so give the last one time to be processed.
+                linger = self._last_send + self.command_wait - asyncio.get_running_loop().time()
+                if linger > 0:
+                    await asyncio.sleep(linger)
             await self._ws_drop()
 
     # ----- cleanup -----
@@ -495,7 +504,7 @@ class RokuSmartHome:
         if loop is None or loop.is_closed() or not loop.is_running():
             return
         try:
-            self._run(self._ws_close_locked(), timeout=self.timeout + 2)
+            self._run(self._ws_close_locked(), timeout=self.timeout + self.command_wait + 2)
         except Exception:
             pass
 
