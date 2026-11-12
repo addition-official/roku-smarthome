@@ -108,6 +108,19 @@ class FakeRoku:
             time.sleep(0.01)
         return self.processed
 
+    def push(self, message: dict):
+        """Send a message to every connected client, like Roku's state reports."""
+        async def go():
+            for ws in list(self._clients):
+                await ws.send(json.dumps(message))
+        asyncio.run_coroutine_threadsafe(go(), self._loop).result(5)
+
+    def wait_for_clients(self, n=1, timeout=5):
+        deadline = time.monotonic() + timeout
+        while len(self._clients) < n and time.monotonic() < deadline:
+            time.sleep(0.01)
+        return len(self._clients)
+
     def drop_all_connections(self):
         """Close every client connection from the server side."""
         async def go():

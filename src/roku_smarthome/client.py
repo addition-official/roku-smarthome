@@ -14,6 +14,7 @@ import asyncio
 import atexit
 import copy
 import json
+import logging
 import operator
 import os
 import threading
@@ -21,7 +22,7 @@ import time
 import uuid
 import weakref
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 import concurrent.futures
 import requests
 import websockets.exceptions
@@ -29,6 +30,8 @@ import websockets.exceptions
 # is still the legacy client, which does not accept additional_headers.
 from websockets.asyncio.client import connect as ws_connect
 from websockets.protocol import State
+
+log = logging.getLogger(__name__)
 
 LEAVES_URL = "https://my.roku.com/smarthome/api/v1/leaves"
 SOCKET_URL = "wss://aspen-sockets.aspen.msc.roku.com/v1/socket"
@@ -256,6 +259,8 @@ class RokuSmartHome:
 
     Call close() (or use `with RokuSmartHome() as rk:`) when you are done. It is
     also called automatically when the interpreter exits.
+
+    For live updates, register a callback with on_change(); see its docstring.
     """
 
     def __init__(self, cookie_file: Optional[os.PathLike] = None, *,
@@ -287,6 +292,15 @@ class RokuSmartHome:
         self._connects = 0  # connections opened, for tests and debugging
         self._last_send = 0.0  # loop time of the last command on self._ws
         self._pending: Dict[str, tuple] = {}  # command id -> (websocket, Future)
+
+        # live updates (on_change)
+        self._listeners: List[Callable[["Device"], None]] = []
+        self._listeners_lock = threading.Lock()
+        self._listening = False             # touched on the event loop thread
+        self._live: Dict[str, dict] = {}    # leaf id -> raw device, kept current
+        self._live_alias: Dict[str, str] = {}  # device.id -> leaf id
+        self._reconnect_task: Optional[asyncio.Task] = None
+        self._events: Optional[concurrent.futures.ThreadPoolExecutor] = None
 
         atexit.register(_close_at_exit, weakref.ref(self))
 
@@ -664,7 +678,7 @@ class RokuSmartHome:
         # and hand Roku's replies to the commands waiting for them.
         try:
             async for raw in ws:
-                self._dispatch_reply(raw)
+                self._dispatch(raw)
         except Exception:
             pass
         if self._ws is ws:
@@ -674,13 +688,18 @@ class RokuSmartHome:
                 fut.set_exception(RokuUnavailable(
                     "connection closed before Roku confirmed the command; "
                     "it may or may not have been applied"))
+        if self._listening and (self._reconnect_task is None or self._reconnect_task.done()):
+            self._reconnect_task = asyncio.get_running_loop().create_task(self._reconnect())
 
-    def _dispatch_reply(self, raw):
+    def _dispatch(self, raw):
         try:
             m = json.loads(raw)
         except (TypeError, ValueError):
             return
         if not isinstance(m, dict):
+            return
+        if m.get("type") == "leaf_state_report":
+            self._apply_state_report(m.get("payload"))
             return
         entry = self._pending.get(m.get("id"))
         if entry is not None and m.get("type") in ("send_command_resp", "send_command"):
@@ -692,7 +711,7 @@ class RokuSmartHome:
         if self._idle_handle is not None:
             self._idle_handle.cancel()
             self._idle_handle = None
-        if self.idle_timeout > 0:
+        if self.idle_timeout > 0 and not self._listening:
             loop = asyncio.get_running_loop()
             self._idle_handle = loop.call_later(
                 self.idle_timeout, lambda: loop.create_task(self._ws_close_locked()))
@@ -718,14 +737,172 @@ class RokuSmartHome:
                     await asyncio.sleep(linger)
             await self._ws_drop()
 
+    # ----- live updates -----
+
+    def on_change(self, callback: Callable[["Device"], None]) -> Callable[[], None]:
+        """Call `callback(device)` whenever Roku reports that a device changed,
+        whether from this program, the Roku app, a voice assistant or the
+        device's own button. `device` is a Device with the new state.
+
+        Keeps the connection to Roku open (no idle timeout) until the last
+        callback is removed or close() is called, reconnecting automatically if
+        it drops; changes missed while disconnected are reported on reconnect.
+
+        Callbacks run one at a time on a separate thread, so they may send
+        commands or call devices(). Exceptions in a callback are logged and
+        don't stop updates. Returns a function that removes the callback.
+        """
+        with self._listeners_lock:
+            self._listeners.append(callback)
+            first = len(self._listeners) == 1
+        if first:
+            try:
+                self._run(self._start_listening(), timeout=2 * self.timeout + 5)
+            except BaseException:
+                self._remove_listener(callback)
+                raise
+
+        def unsubscribe():
+            self._remove_listener(callback)
+        return unsubscribe
+
+    def _remove_listener(self, callback):
+        with self._listeners_lock:
+            if callback in self._listeners:
+                self._listeners.remove(callback)
+            last = not self._listeners
+        loop = self._loop
+        if last and loop is not None and loop.is_running():
+            try:
+                self._run(self._stop_listening(), timeout=self.timeout + 2)
+            except Exception:
+                pass
+
+    @property
+    def listening(self) -> bool:
+        """True while live updates are on (some on_change callback is registered)."""
+        return self._listening
+
+    async def _start_listening(self):
+        if self._listening:
+            return
+        self._listening = True
+        try:
+            await self._seed_live(fire=False)
+            async with self._lock():
+                if self._ws is None or self._ws.state is not State.OPEN:
+                    await self._ws_drop()
+                    self._ws = await self._ws_open()
+                    asyncio.get_running_loop().create_task(self._ws_reader(self._ws))
+                self._arm_idle_timer()  # cancels the idle timer while listening
+        except BaseException:
+            self._listening = False
+            raise
+
+    async def _stop_listening(self):
+        if not self._listening:
+            return
+        self._listening = False
+        task, self._reconnect_task = self._reconnect_task, None
+        if task is not None and task is not asyncio.current_task():
+            task.cancel()
+        self._live, self._live_alias = {}, {}
+        if self._ws is not None:
+            self._arm_idle_timer()
+
+    async def _seed_live(self, fire: bool):
+        """Load full device details from the REST list. With fire, report every
+        device whose state differs from what we had (missed while offline)."""
+        loop = asyncio.get_running_loop()
+        fresh = await loop.run_in_executor(None, self.raw_devices, 0)
+        live = {str(r["id"]): r for r in fresh
+                if isinstance(r, dict) and r.get("id") is not None}
+        alias = {}
+        for leaf_id, r in live.items():
+            hw = r.get("device")
+            if isinstance(hw, dict) and hw.get("id") is not None:
+                alias[str(hw["id"])] = leaf_id
+        old, self._live, self._live_alias = self._live, live, alias
+        if fire:
+            for leaf_id, r in live.items():
+                if leaf_id not in old or old[leaf_id].get("state") != r.get("state"):
+                    self._fire(r)
+
+    async def _reconnect(self):
+        delay = 1.0
+        while self._listening:
+            await asyncio.sleep(delay)
+            if not self._listening:
+                return
+            try:
+                async with self._lock():
+                    if self._ws is None or self._ws.state is not State.OPEN:
+                        await self._ws_drop()
+                        self._ws = await self._ws_open()
+                        asyncio.get_running_loop().create_task(self._ws_reader(self._ws))
+                await self._seed_live(fire=True)
+                return
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                log.warning("roku-smarthome: live updates reconnect failed (%s); "
+                            "retrying in %.0f s", e, min(delay * 2, 60))
+                delay = min(delay * 2, 60.0)
+
+    def _apply_state_report(self, payload):
+        # {"type": "leaf_state_report", "payload": [{"id": ..., "type": "device",
+        #   "state": {"power": {"power": "on", "updated": ..., "eventId": ...}}}]}
+        # Only the parts of the state that changed are included.
+        if not self._listening or not isinstance(payload, list):
+            return
+        for item in payload:
+            if not isinstance(item, dict) or not isinstance(item.get("state"), dict):
+                continue
+            rid = str(item.get("id"))
+            leaf_id = rid if rid in self._live else self._live_alias.get(rid)
+            if leaf_id is None:
+                continue
+            raw = self._live[leaf_id]
+            state = raw.get("state") if isinstance(raw.get("state"), dict) else {}
+            raw["state"] = {**state, **item["state"]}
+            self._fire(raw)
+
+    def _fire(self, raw: dict):
+        if not self._listeners:
+            return
+        if self._events is None:
+            self._events = concurrent.futures.ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="roku-smarthome-events")
+        self._events.submit(self._call_listeners, copy.deepcopy(raw))
+
+    def _call_listeners(self, raw: dict):
+        try:
+            device = Device(self, raw)
+        except Exception:
+            log.exception("roku-smarthome: could not read a device update")
+            return
+        with self._listeners_lock:
+            listeners = list(self._listeners)
+        for cb in listeners:
+            try:
+                cb(device)
+            except Exception:
+                log.exception("roku-smarthome: on_change callback %r failed", cb)
+
     # ----- cleanup -----
 
     def close(self):
-        """Close the shared websocket, flushing anything still being sent.
-        Safe to call more than once; the next command reopens it."""
+        """Stop live updates and close the shared websocket, flushing anything
+        still being sent. Safe to call more than once; the next command reopens it."""
+        with self._listeners_lock:
+            self._listeners.clear()
         loop = self._loop
         if loop is None or loop.is_closed() or not loop.is_running():
             return
+        try:
+            self._run(self._stop_listening(), timeout=self.timeout + 2)
+        except Exception:
+            pass
         try:
             self._run(self._ws_close_locked(), timeout=self.timeout + self.command_wait + 2)
         except Exception:

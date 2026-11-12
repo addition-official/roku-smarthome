@@ -33,11 +33,9 @@ Still to check on real devices: that Roku accepts several commands on one connec
 
 Captured on real hardware: Roku answers every command with a message carrying the command's `id`, either `{"type": "send_command_resp"}` on success or `{"type": "send_command", "error": "..."}` on failure ("failed to execute command" for a bad value or unsupported command, "forbidden request" for a device that isn't on the account). Commands now wait for that reply (`confirm=True`, the default) and raise `CommandFailed` on an error.
 
-### 6. Live state updates
+### 6. Live state updates - done (needs hardware testing)
 
-Roku also pushes `leaf_state_report` messages on the websocket when a device changes, e.g. `{"type": "leaf_state_report", "payload": [{"id": ..., "state": {"power": {"power": "on", ...}}}]}`. The background reader could apply these to the cache and offer a callback (`rk.on_change(fn)`), so dashboards update instantly without polling.
-
-## Bigger features
+`rk.on_change(callback)` listens for Roku's `leaf_state_report` pushes, merges the changed state onto the full device details from the REST list, and calls the callback with a `Device` on a separate thread. Reconnects with backoff and reports changes missed while offline. `roku-smarthome watch` prints them. Still to confirm on real devices: which id the reports use (the leaf id or the device serial; both are matched) and how long Roku keeps a listening connection open.
 
 ### 7. Scenes
 

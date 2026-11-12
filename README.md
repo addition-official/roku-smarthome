@@ -66,6 +66,7 @@ roku-smarthome temp "Bedroom bulb" 3000                 # Kelvin, 1800-6500
 roku-smarthome rgb "Color bulb" 255 80 0                # color bulbs only
 roku-smarthome rgb "Color bulb" "#ff5000"               # same, as a hex color
 roku-smarthome json                                     # raw device list, for piping elsewhere
+roku-smarthome watch                                    # print changes live, from anywhere (Ctrl-C to stop)
 roku-smarthome --cookies PATH status                    # use a different cookie file
 ```
 
@@ -117,6 +118,23 @@ with RokuSmartHome() as rk:
 ```
 
 Pass `persistent=False` to go back to one connection per command (the behavior before 0.2.3).
+
+### Live updates
+
+Roku pushes a message whenever a device changes, whether from your code, the Roku app, a voice assistant or the device's own button. Register a callback to hear about it, instead of polling:
+
+```python
+rk = RokuSmartHome()
+
+def changed(device):
+    print(device.name, device.power, device.brightness)
+
+stop = rk.on_change(changed)   # keeps the connection open and listens
+...
+stop()                         # or rk.close()
+```
+
+`device` is a full `Device` with the new state. Callbacks run one at a time on their own thread, so they can send commands. If the connection drops, it reconnects automatically and reports any changes it missed. From the command line, `roku-smarthome watch` prints the same updates.
 
 Exceptions: `SessionExpired` (saved cookie no longer works; run `login` again), `RokuUnavailable` (Roku's API unreachable or erroring, or no reply to a command; retry later), `CommandFailed` (Roku received the command and reported an error, e.g. `failed to execute command`), `DeviceNotFound`, and `UnsupportedCommand` (raised instead of sending a command the device doesn't list).
 

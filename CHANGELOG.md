@@ -14,6 +14,7 @@ Nothing yet.
 - `rgb` accepts hex colors: `roku-smarthome rgb "Color bulb" "#ff8000"`.
 - Separate CLI exit codes: 1 error, 2 bad arguments, 3 session expired, 4 Roku unavailable.
 - `login` accepts a whole "Copy as cURL" line or a `Cookie:` prefix.
+- Live updates: `rk.on_change(callback)` is called whenever a device changes, from anywhere (the Roku app, voice assistants, the device's button). `roku-smarthome watch` prints changes as they happen.
 - Commands wait for Roku's reply and raise the new `CommandFailed` if Roku reports an error (CLI exit code 5). A missing reply raises `RokuUnavailable`. `confirm=False` skips the wait.
 
 ### Fixed

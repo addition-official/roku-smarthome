@@ -1,6 +1,7 @@
 import argparse
 import json
 import sys
+import time
 
 from .client import (RokuSmartHome, SessionExpired, RokuUnavailable, UnsupportedCommand,
                      DeviceNotFound, CommandFailed)
@@ -33,6 +34,18 @@ def parse_color(values):
     raise ValueError("give a hex color like #ff8000 or three numbers like 255 128 0")
 
 
+def describe(d):
+    extra = ""
+    if d.brightness is not None:
+        extra += f" {d.brightness}%"
+    if d.color_temp is not None:
+        extra += f" {d.color_temp}K"
+    if d.color_rgb:
+        extra += f" rgb{tuple(d.color_rgb)}"
+    return (f"{d.name:32} {d.type:8} {(d.power or '?').upper():4} "
+            f"({'online' if d.online else 'OFFLINE'}){extra}")
+
+
 def fail(message, code):
     print(message, file=sys.stderr)
     sys.exit(code)
@@ -54,6 +67,9 @@ def main(argv=None):
 
     sub.add_parser("status", help="list devices and state")
     sub.add_parser("json", help="dump raw device list as JSON")
+
+    sp = sub.add_parser("watch", help="print device changes as they happen (Ctrl-C to stop)")
+    sp.add_argument("--seconds", type=float, help="stop after this many seconds")
 
     for name in ("on", "off", "toggle"):
         sp = sub.add_parser(name)
@@ -85,15 +101,21 @@ def main(argv=None):
 
         if args.cmd == "status":
             for d in rk.devices():
-                extra = ""
-                if d.brightness is not None:
-                    extra += f" {d.brightness}%"
-                if d.color_temp is not None:
-                    extra += f" {d.color_temp}K"
-                if d.color_rgb:
-                    extra += f" rgb{tuple(d.color_rgb)}"
-                print(f"{d.name:32} {d.type:8} {(d.power or '?').upper():4} "
-                      f"({'online' if d.online else 'OFFLINE'}){extra}")
+                print(describe(d))
+            return
+
+        if args.cmd == "watch":
+            rk.on_change(lambda d: print(f"{time.strftime('%H:%M:%S')}  {describe(d)}",
+                                         flush=True))
+            print("Watching for changes (Ctrl-C to stop)...", flush=True)
+            try:
+                if args.seconds is not None:
+                    time.sleep(args.seconds)
+                else:
+                    while True:
+                        time.sleep(3600)
+            except KeyboardInterrupt:
+                pass
             return
 
         if args.cmd == "json":
