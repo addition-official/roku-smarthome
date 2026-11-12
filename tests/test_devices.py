@@ -124,3 +124,71 @@ def test_color_temp_validation(client):
             bulb.set_color_temp(bad)
     assert len(client.sent) == 2
     assert bulb.color_temp == 6500
+
+
+
+@pytest.mark.parametrize("leaf", [
+    {"id": "x", "name": None, "device": None, "state": None, "supportedCommands": None},
+    {"id": "x", "state": {"power": None, "online": None, "brightness": None, "color": None}},
+    {"id": "x", "supportedCommands": [None, "power", {"type": None}, {"type": "power"}]},
+    {"id": 123},
+])
+def test_nulls_and_junk_do_not_crash(client, leaf):
+    d = Device(client, leaf)
+    assert d.name == "" and d.power is None and d.brightness is None
+    assert d.supported_commands <= {"power"}
+    repr(d)
+
+
+def test_status_and_get_survive_null_names(client, capsys):
+    from roku_smarthome import cli
+    client.fake_leaves.append({"id": "nameless", "name": None, "state": None})
+    client.fake_leaves.append(None)          # junk entries are skipped
+    client.fake_leaves.append({"name": "no id"})
+    assert client.get("bedroom bulb").id == "leaf-1"
+    assert client.get("nameless", by_id=True).name == ""
+    import roku_smarthome.cli as cli_mod
+    orig = cli_mod.RokuSmartHome
+    cli_mod.RokuSmartHome = lambda cookies=None: client
+    try:
+        cli.main(["status"])
+    finally:
+        cli_mod.RokuSmartHome = orig
+    assert "Bedroom Bulb" in capsys.readouterr().out
+
+
+def test_duplicate_names_are_refused_by_get(client):
+    client.fake_leaves = [make_leaf(id="a", name="Lamp"), make_leaf(id="b", name="lamp")]
+    with pytest.raises(DeviceNotFound) as exc:
+        client.get("Lamp")
+    assert "a" in str(exc.value) and "b" in str(exc.value)
+    assert client.get("b", by_id=True).id == "b"
+
+
+@pytest.mark.parametrize("bad", [50.9, True, False, "50", None, 0.5])
+def test_brightness_rejects_non_whole_numbers(client, bad):
+    with pytest.raises(ValueError):
+        client.get("Bedroom Bulb").set_brightness(bad)
+    assert client.sent == []
+
+
+def test_whole_floats_are_accepted(client):
+    bulb = client.get("Bedroom Bulb")
+    bulb.set_brightness(50.0)
+    bulb.set_color_temp(3000.0)
+    assert client.sent[0][2] == {"level": 50}
+    assert client.sent[1][2]["temperature"] == 3000
+
+
+@pytest.mark.parametrize("rgb", [(255.9, 0, 0), (-0.5, 0, 0), (True, 0, 0), (-1, 0, 0), ("1", 2, 3)])
+def test_rgb_rejects_bad_values(client, rgb):
+    with pytest.raises(ValueError):
+        client.get("Bedroom Bulb").set_color_rgb(*rgb)
+    assert client.sent == []
+
+
+@pytest.mark.parametrize("bad", [0, -100, 100000, 3000.5])
+def test_color_temp_rejects_qa_values(client, bad):
+    with pytest.raises(ValueError):
+        client.get("Bedroom Bulb").set_color_temp(bad)
+    assert client.sent == []

@@ -44,7 +44,7 @@ Or clone this repo and `pip install .` to build the exact package that's publish
 roku-smarthome login
 ```
 
-Paste the cookie value when prompted. It's verified against your account and saved to a per-user file (`%USERPROFILE%\.config\roku-smarthome\cookies.json` on Windows, `~/.config/roku-smarthome/cookies.json` on macOS/Linux). Set `ROKU_SMARTHOME_COOKIES` or pass `--cookies PATH` to use a different location.
+Paste the cookie value when prompted (a whole "Copy as cURL" line or a `Cookie:` prefix is fine too). It's verified against your account before it's saved, so a bad paste keeps your previous login, and it's saved to a per-user file (`%USERPROFILE%\.config\roku-smarthome\cookies.json` on Windows, `~/.config/roku-smarthome/cookies.json` on macOS/Linux). Set `ROKU_SMARTHOME_COOKIES` or pass `--cookies PATH` to use a different location.
 
 > **Keep that file private.** It is a working login to your Roku account. Don't share it, and don't paste the cookie into chat windows or bug reports. It's stored outside the project folder, so it can't be committed by accident.
 
@@ -73,7 +73,7 @@ Device names are matched case-insensitively against the names in the Roku Smart 
 
 Exit codes, for scripts and cron jobs: `0` OK, `1` error (unknown device, bad value, unsupported command), `2` bad arguments, `3` session expired (run `login` again), `4` Roku unreachable (retry later).
 
-In Python, `rk.find("porch")` does the same forgiving lookup; `rk.get(name)` still requires the exact name.
+In Python, `rk.find("porch")` does the same forgiving lookup; `rk.get(name)` still requires the exact name, and refuses to guess if two devices share it (use `rk.get(id, by_id=True)` then).
 
 ## Use it as a library
 
@@ -146,7 +146,8 @@ The Roku Smart Home line is Wyze hardware sold under the Roku brand, but the dev
 - **Unofficial.** Roku could change or remove these endpoints at any time. If `status` starts failing with something other than `SESSION EXPIRED`, that's probably what happened; please open an issue with the error (and the cookie value removed).
 - **Cameras** are listed with name and online state only. Streams, events and settings are visible in the API but not implemented here.
 - **RGB color** was implemented from Roku's web app without a color bulb to test on, and has since been confirmed working by a user ([#1](https://github.com/addition-official/roku-smarthome/issues/1)). The parameter shape is `{"colorType": "rgb", "rgb": [r, g, b]}`, each 0 to 255.
-- Commands are fire-and-forget over the websocket. Call `refresh()` if you need to confirm the new state.
+- Commands are fire-and-forget over the websocket: if Roku replies with an error, it isn't reported yet. Call `refresh()` if you need to confirm the new state.
+- `toggle()` flips based on the state the `Device` object last saw. If something else may have changed the device, call `refresh()` first.
 - The shared connection is only tested against a local fake server so far, not real Roku hardware. If commands start failing after a period of inactivity, try `persistent=False` and please open an issue.
 
 ## Project layout

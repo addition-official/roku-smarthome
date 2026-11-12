@@ -33,6 +33,7 @@ class FakeRoku:
         self.chatter = 0
         self.received = []
         self.processed = []
+        self.custom_handler = None  # replaces the default behavior if set
         self.process_delay = 0.3
         self.connections = 0
         self.headers = []
@@ -60,6 +61,8 @@ class FakeRoku:
         return None
 
     async def _handler(self, ws):
+        if self.custom_handler:
+            return await self.custom_handler(ws)
         self.connections += 1
         self._clients.add(ws)
         try:
@@ -223,7 +226,7 @@ def test_idle_timeout_closes_and_next_command_reopens(make_client, server):
     rk, bulb = make_client(idle_timeout=0.2)
     bulb.turn_on()
     server.wait_for_messages(1)
-    time.sleep(0.5)
+    time.sleep(1)  # idle timeout, plus the 0.5 s wait after the last command
     assert rk._ws is None
     bulb.turn_off()
     assert len(server.wait_for_messages(2)) == 2
@@ -353,3 +356,33 @@ def test_cli_command_is_processed(server, cookie_file, monkeypatch):
     monkeypatch.setattr(cli, "RokuSmartHome", lambda cookies=None: rk)
     cli.main(["on", "bedroom"])
     assert len(server.wait_for_processed(1)) == 1
+
+
+
+def test_server_closing_after_delivered_command_is_not_an_error(make_client, server):
+    # Non-persistent mode lingers after sending. If Roku closes the connection
+    # normally during that time, the command was delivered: no exception, or
+    # a caller that retries would send it twice (and a toggle would undo itself).
+    async def close_after_first_message(ws):
+        server.connections += 1
+        async for message in ws:
+            server.received.append(json.loads(message))
+            await ws.close()
+    server.custom_handler = close_after_first_message
+    rk, bulb = make_client(persistent=False, command_wait=1)
+    bulb.turn_on()
+    assert len(server.wait_for_messages(1)) == 1
+
+
+def test_persistent_server_close_after_command_is_not_an_error(make_client, server):
+    async def close_after_first_message(ws):
+        server.connections += 1
+        async for message in ws:
+            server.received.append(json.loads(message))
+            await ws.close()
+    server.custom_handler = close_after_first_message
+    rk, bulb = make_client()
+    bulb.turn_on()          # delivered, then the server closes
+    time.sleep(0.2)
+    bulb.turn_off()         # must reconnect, not fail
+    assert len(server.wait_for_messages(2)) == 2

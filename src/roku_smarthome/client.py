@@ -12,7 +12,9 @@ client is used at least once a year the login never expires.
 
 import asyncio
 import atexit
+import copy
 import json
+import operator
 import os
 import threading
 import time
@@ -53,6 +55,53 @@ _UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
        "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
 
 
+def _whole_number(value, what: str) -> int:
+    """Accept ints (and floats like 50.0); reject 50.9, True, "50" and the like
+    instead of silently rounding them."""
+    if isinstance(value, bool):
+        raise ValueError(f"{what} must be a whole number, got {value!r}")
+    if isinstance(value, float):
+        if not value.is_integer():
+            raise ValueError(f"{what} must be a whole number, got {value!r}")
+        return int(value)
+    try:
+        return operator.index(value)
+    except TypeError:
+        raise ValueError(f"{what} must be a whole number, got {value!r}") from None
+
+
+def _clean_cookie_header(header: str) -> str:
+    """Strip what tends to come along when the header is copied from DevTools
+    or a "Copy as cURL" line: -H/-b flags, quotes, a 'Cookie:' prefix and the
+    trailing line-continuation backslash."""
+    h = header.strip().rstrip("\\").strip()
+    for flag in ("--header", "--cookie", "-H", "-b"):
+        if h.startswith(flag + " "):
+            h = h[len(flag):].strip()
+            break
+    if len(h) >= 2 and h[0] == h[-1] and h[0] in "'\"":
+        h = h[1:-1].strip()
+    if h.lower().startswith("cookie:"):
+        h = h[len("cookie:"):].strip()
+    return h
+
+
+def parse_cookie_header(header: str) -> Dict[str, str]:
+    """Parse a Cookie header by hand: SimpleCookie silently returns nothing if
+    the header contains a bare token without '=' (browsers emit these, e.g.
+    'roku_test;')."""
+    cookies: Dict[str, str] = {}
+    for part in _clean_cookie_header(header).split(";"):
+        part = part.strip()
+        if not part or "=" not in part:
+            continue
+        k, v = part.split("=", 1)
+        k, v = k.strip(), v.strip()
+        if k:
+            cookies[k] = v
+    return cookies
+
+
 class SessionExpired(Exception):
     """The saved Roku session no longer works. Run `roku-smarthome login` again."""
 
@@ -78,21 +127,29 @@ class Device:
         self._load(raw)
 
     def _load(self, raw: dict):
+        # Roku's JSON can have nulls anywhere; treat a null like a missing key.
+        def obj(parent, key) -> dict:
+            v = parent.get(key)
+            return v if isinstance(v, dict) else {}
+
         self.raw = raw
-        self.id: str = raw["id"]
-        self.name: str = raw.get("name", "")
-        self.type: str = raw.get("subType") or raw.get("device", {}).get("type", "")
-        self._leaf_type: str = raw.get("type", "device")
-        self.model: str = raw.get("device", {}).get("model", "")
-        self.local_ip: str = raw.get("device", {}).get("localIp", "")
+        self.id: str = str(raw["id"])
+        self.name: str = raw.get("name") or ""
+        hw = obj(raw, "device")
+        self.type: str = raw.get("subType") or hw.get("type") or ""
+        self._leaf_type: str = raw.get("type") or "device"
+        self.model: str = hw.get("model") or ""
+        self.local_ip: str = hw.get("localIp") or ""
+        commands = raw.get("supportedCommands")
         self.supported_commands = {
-            c.get("type") for c in raw.get("supportedCommands", []) if c.get("type")
+            c.get("type") for c in (commands if isinstance(commands, list) else [])
+            if isinstance(c, dict) and c.get("type")
         }
-        state = raw.get("state", {}) or {}
-        self.power: Optional[str] = state.get("power", {}).get("power")
-        self.online: Optional[bool] = state.get("online", {}).get("online")
-        self.brightness: Optional[int] = state.get("brightness", {}).get("level")
-        color = state.get("color", {})
+        state = obj(raw, "state")
+        self.power: Optional[str] = obj(state, "power").get("power")
+        self.online: Optional[bool] = obj(state, "online").get("online")
+        self.brightness: Optional[int] = obj(state, "brightness").get("level")
+        color = obj(state, "color")
         self.color_temp: Optional[int] = color.get("temperature")
         self.color_type: Optional[str] = color.get("colorType")
         self.color_rgb: Optional[list] = color.get("rgb")
@@ -129,24 +186,28 @@ class Device:
         self.power = "off"
 
     def toggle(self):
+        """Flip power based on the state this object last saw. If something
+        else may have changed the device since, call refresh() first."""
         self.turn_off() if self.is_on else self.turn_on()
 
     def set_brightness(self, level: int):
+        level = _whole_number(level, "brightness")
         if not 0 <= level <= 100:
             raise ValueError("brightness must be 0..100")
-        self.send("brightness", {"level": int(level)})
-        self.brightness = int(level)
+        self.send("brightness", {"level": level})
+        self.brightness = level
 
     def set_color_temp(self, kelvin: int):
+        kelvin = _whole_number(kelvin, "color temperature")
         if not COLOR_TEMP_MIN <= kelvin <= COLOR_TEMP_MAX:
             raise ValueError(
                 f"color temperature must be {COLOR_TEMP_MIN}..{COLOR_TEMP_MAX} K")
-        self.send("color", {"colorType": "temperature", "temperature": int(kelvin)})
-        self.color_temp = int(kelvin)
+        self.send("color", {"colorType": "temperature", "temperature": kelvin})
+        self.color_temp = kelvin
         self.color_type = "temperature"
 
     def set_color_rgb(self, r: int, g: int, b: int):
-        rgb = [int(r), int(g), int(b)]
+        rgb = [_whole_number(v, "rgb value") for v in (r, g, b)]
         if any(not 0 <= v <= 255 for v in rgb):
             raise ValueError("rgb values must be 0..255")
         self.send("color", {"colorType": "rgb", "rgb": rgb})
@@ -211,43 +272,81 @@ class RokuSmartHome:
     # ----- cookie handling -----
 
     def _load_session(self):
+        self._cookie_error: Optional[str] = None
+        self._use_cookies(self._read_cookie_file())
+
+    def _use_cookies(self, cookies: Dict[str, str]):
+        self._cookies: Dict[str, str] = dict(cookies)
         self._session = requests.Session()
         self._session.headers["User-Agent"] = _UA
-        self._cookies: Dict[str, str] = self._read_cookie_file()
+        self._sync_jar()
+
+    def _sync_jar(self):
+        """Make the session hold exactly one copy of each saved cookie. Roku can
+        renew a cookie without a Domain attribute, which would otherwise leave
+        an old .roku.com copy next to the new my.roku.com one, both sent."""
+        jar = self._session.cookies
+        for c in list(jar):
+            if c.name not in _SKIP:
+                jar.clear(c.domain, c.path, c.name)
         for k, v in self._cookies.items():
             if k not in _SKIP:
-                self._session.cookies.set(k, v, domain=".roku.com", path="/")
+                jar.set(k, v, domain=".roku.com", path="/")
 
     def _read_cookie_file(self) -> Dict[str, str]:
         if not self.cookie_file.exists():
             return {}
-        return json.loads(self.cookie_file.read_text())
+        try:
+            data = json.loads(self.cookie_file.read_text())
+        except (OSError, ValueError) as e:
+            self._cookie_error = f"Cookie file {self.cookie_file} is unreadable ({e})."
+            return {}
+        if not isinstance(data, dict) or not all(
+                isinstance(k, str) and isinstance(v, str) for k, v in data.items()):
+            self._cookie_error = f"Cookie file {self.cookie_file} is not in the expected format."
+            return {}
+        return data
 
     def _write_cookie_file(self):
-        self.cookie_file.parent.mkdir(parents=True, exist_ok=True)
-        self.cookie_file.write_text(json.dumps(self._cookies, indent=2))
+        # Write a private temp file and swap it in: the file is never readable
+        # by other users, and a crash mid-write can't leave it half-written.
+        path = self.cookie_file
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + ".tmp")
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write(json.dumps(self._cookies, indent=2))
         try:
-            self.cookie_file.chmod(0o600)
+            os.chmod(tmp, 0o600)  # in case a stale temp file had other permissions
         except OSError:
             pass
+        os.replace(tmp, path)
 
-    def import_cookie_header(self, header: str) -> int:
-        """Store a raw `Cookie:` header value copied from the browser. Returns cookie count.
-        Parsed by hand: SimpleCookie silently returns nothing if the header contains a
-        bare token without '=' (browsers do emit these, e.g. 'roku_test;')."""
-        cookies: Dict[str, str] = {}
-        for part in header.split(";"):
-            part = part.strip()
-            if not part or "=" not in part:
-                continue
-            k, v = part.split("=", 1)
-            k, v = k.strip(), v.strip()
-            if k:
-                cookies[k] = v
-        self._cookies = cookies
-        self._write_cookie_file()
-        self._load_session()
+    def import_cookie_header(self, header: str, verify: bool = False) -> int:
+        """Store a `Cookie:` header value copied from the browser (a "Copy as cURL"
+        line or a 'Cookie:' prefix is fine too). Returns the cookie count.
+
+        Raises ValueError if there is no ks.session cookie in it. With verify=True,
+        the new cookies are checked against Roku first; if that fails, the
+        previously saved session is kept and the error is raised."""
+        cookies = parse_cookie_header(header)
+        if "ks.session" not in cookies:
+            raise ValueError(
+                "no ks.session cookie found. Copy the whole Cookie header from the "
+                "'leaves' request on my.roku.com/smarthome")
+        old_cookies, old_error = self._cookies, self._cookie_error
+        self._cookie_error = None
+        self._use_cookies(cookies)
         self.invalidate()
+        if verify:
+            try:
+                self.raw_devices(max_age=0)
+            except BaseException:
+                self._cookie_error = old_error
+                self._use_cookies(old_cookies)
+                self.invalidate()
+                raise
+        self._write_cookie_file()
         return len(self._cookies)
 
     def _persist_refreshed_cookies(self):
@@ -258,6 +357,7 @@ class RokuSmartHome:
             if self._cookies.get(c.name) != c.value:
                 self._cookies[c.name] = c.value
                 changed = True
+        self._sync_jar()
         if changed:
             self._write_cookie_file()
 
@@ -278,9 +378,8 @@ class RokuSmartHome:
 
     def _fetch_leaves(self) -> List[dict]:
         if not self.has_session:
-            raise SessionExpired(
-                f"No session saved at {self.cookie_file}. Run: roku-smarthome login '<cookie>'"
-            )
+            reason = self._cookie_error or f"No session saved at {self.cookie_file}."
+            raise SessionExpired(f"{reason} Run: roku-smarthome login")
         try:
             r = self._session.get(
                 LEAVES_URL,
@@ -291,41 +390,55 @@ class RokuSmartHome:
         except requests.RequestException as e:
             raise RokuUnavailable(f"could not reach Roku: {e}") from e
 
-        if r.status_code in (301, 302, 401, 403):
+        code = r.status_code
+        # a redirect means "go log in"
+        if 300 <= code < 400 or code in (401, 403):
             raise SessionExpired(
-                f"Roku rejected the saved session (HTTP {r.status_code}). Run: roku-smarthome login '<cookie>'"
+                f"Roku rejected the saved session (HTTP {code}). Run: roku-smarthome login"
             )
-        if r.status_code >= 500:
-            raise RokuUnavailable(f"Roku returned HTTP {r.status_code}")
-        r.raise_for_status()
+        if code == 429:
+            raise RokuUnavailable("Roku is rate limiting requests (HTTP 429); slow down and retry")
+        if code >= 400:
+            raise RokuUnavailable(f"Roku returned HTTP {code}")
         self._persist_refreshed_cookies()
         try:
-            return r.json()
+            data = r.json()
         except ValueError as e:
             raise RokuUnavailable("Roku returned a non-JSON device list") from e
+        if not isinstance(data, list):
+            raise RokuUnavailable(
+                f"Roku returned an unexpected device list ({type(data).__name__}, not a list)")
+        return data
 
     def raw_devices(self, max_age: Optional[float] = None) -> List[dict]:
         """Device list as raw JSON. Served from cache if it is younger than max_age
         seconds (default: self.cache_ttl). Pass max_age=0 to force a fetch."""
         ttl = self.cache_ttl if max_age is None else float(max_age)
         with self._cache_lock:
-            if (self._cache_raw is not None and ttl > 0
-                    and time.monotonic() - self._cache_ts <= ttl):
-                return list(self._cache_raw)
-            raw = self._fetch_leaves()
-            self._cache_raw = raw
-            self._cache_ts = time.monotonic()
-            return list(raw)
+            if (self._cache_raw is None or ttl <= 0
+                    or time.monotonic() - self._cache_ts > ttl):
+                self._cache_raw = self._fetch_leaves()
+                self._cache_ts = time.monotonic()
+            # a deep copy, so callers editing the result can't change the cache
+            return copy.deepcopy(self._cache_raw)
 
     def devices(self, max_age: Optional[float] = None) -> List[Device]:
-        return [Device(self, raw) for raw in self.raw_devices(max_age)]
+        return [Device(self, raw) for raw in self.raw_devices(max_age)
+                if isinstance(raw, dict) and raw.get("id") is not None]
 
     def get(self, name_or_id: str, by_id: bool = False,
             max_age: Optional[float] = None) -> Device:
+        """Exact lookup by name (any case) or, with by_id=True, by id. Raises
+        DeviceNotFound if nothing matches, or if several devices share the name."""
         key = name_or_id.lower()
-        for d in self.devices(max_age):
-            if (by_id and d.id == name_or_id) or (not by_id and d.name.lower() == key):
-                return d
+        matches = [d for d in self.devices(max_age)
+                   if (d.id == name_or_id if by_id else d.name.lower() == key)]
+        if len(matches) == 1:
+            return matches[0]
+        if matches:
+            ids = ", ".join(d.id for d in matches)
+            raise DeviceNotFound(
+                f"several devices are named {name_or_id!r} (ids: {ids}); use get(id, by_id=True)")
         raise DeviceNotFound(name_or_id)
 
     def find(self, query: str, max_age: Optional[float] = None) -> Device:
@@ -411,9 +524,14 @@ class RokuSmartHome:
         """Open a connection, send one command, linger `wait` seconds, close."""
         ws = await self._ws_open()
         try:
-            await ws.send(json.dumps(msg))
-            # Server chats on connect (init / stream_init / leaves). Give it a
-            # moment so the command is flushed before we close, then leave.
+            try:
+                await ws.send(json.dumps(msg))
+            except (OSError, websockets.exceptions.WebSocketException) as e:
+                raise RokuUnavailable(f"websocket error: {e}") from e
+            # The command is sent. Server chats on connect (init / stream_init /
+            # leaves); give it a moment to process the command before we close.
+            # If Roku closes the connection itself meanwhile, that's fine: the
+            # command was already delivered, so don't report a failure.
             deadline = asyncio.get_running_loop().time() + wait
             while True:
                 remaining = deadline - asyncio.get_running_loop().time()
@@ -421,10 +539,9 @@ class RokuSmartHome:
                     break
                 try:
                     await asyncio.wait_for(ws.recv(), timeout=remaining)
-                except asyncio.TimeoutError:
+                except (asyncio.TimeoutError, OSError,
+                        websockets.exceptions.WebSocketException):
                     break
-        except (OSError, websockets.exceptions.WebSocketException) as e:
-            raise RokuUnavailable(f"websocket error: {e}") from e
         finally:
             await ws.close()
 

@@ -29,12 +29,16 @@ Still to check on real devices: that Roku accepts several commands on one connec
 - Hex colors: `rgb "Color bulb" "#ff8000"` (or `#f80`), alongside three numbers.
 - Distinct exit codes: 1 error, 2 bad arguments, 3 session expired, 4 Roku unavailable.
 
+### 5. Report errors Roku sends back for commands
+
+Commands are fire-and-forget: the background reader discards everything Roku sends on the websocket, so if Roku answers a command with an error, the caller never hears about it. Fixing this needs a capture of what Roku actually sends back after a good and a bad command (the diagnostic script from the 0.2.3 hardware testing prints every message). Then the client can match replies to the command `id` and raise on errors.
+
 ## Bigger features
 
-### 5. Scenes
+### 6. Scenes
 
 Requested in [#1](https://github.com/addition-official/roku-smarthome/issues/1). Needs a capture of what my.roku.com sends when a scene is listed and activated (with the cookie removed) before it can be built.
 
-### 6. Home Assistant integration
+### 7. Home Assistant integration
 
 The [Home Assistant community thread](https://community.home-assistant.io/t/roku-smart-home-integration/477613) is full of people who want this, and there's no working option for Roku Smart Home devices. It would reach the most people of anything here, but it's a separate project (a custom integration installable through HACS) built on top of this library.

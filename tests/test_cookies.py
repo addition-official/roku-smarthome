@@ -28,10 +28,82 @@ def test_value_containing_equals_sign_is_kept_whole(cookie_file):
     assert rk._cookies == {"ks.session": "a=b==", "y": "2"}
 
 
-def test_empty_header_saves_no_session(cookie_file):
+@pytest.mark.parametrize("header", ["", "  ;; ", "other=1; foo=bar"])
+def test_header_without_session_is_rejected_and_old_login_kept(cookie_file, header):
     rk = RokuSmartHome(cookie_file)
-    assert rk.import_cookie_header("  ;; ") == 0
+    rk.import_cookie_header("ks.session=good")
+    with pytest.raises(ValueError):
+        rk.import_cookie_header(header)
+    assert rk._cookies == {"ks.session": "good"}
+    assert json.loads(cookie_file.read_text()) == {"ks.session": "good"}
+
+
+@pytest.mark.parametrize("pasted", [
+    "Cookie: ks.session=abc; x=1",
+    "cookie: ks.session=abc; x=1",
+    "'ks.session=abc; x=1'",
+    '"ks.session=abc; x=1"',
+    "-H 'Cookie: ks.session=abc; x=1' \\",
+    "-H 'cookie: ks.session=abc; x=1'",
+    "-b 'ks.session=abc; x=1'",
+    "  ks.session=abc; x=1  \n",
+])
+def test_pasted_variants_are_cleaned(cookie_file, pasted):
+    rk = RokuSmartHome(cookie_file)
+    rk.import_cookie_header(pasted)
+    assert rk._cookies == {"ks.session": "abc", "x": "1"}
+
+
+def test_failed_verification_keeps_old_login(cookie_file):
+    from roku_smarthome import SessionExpired
+    rk = RokuSmartHome(cookie_file)
+    rk.import_cookie_header("ks.session=good")
+
+    def reject():
+        raise SessionExpired("bad cookie")
+    rk._fetch_leaves = reject
+    with pytest.raises(SessionExpired):
+        rk.import_cookie_header("ks.session=bad", verify=True)
+    assert rk._cookies == {"ks.session": "good"}
+    assert json.loads(cookie_file.read_text()) == {"ks.session": "good"}
+    assert rk._cookie_header() == "ks.session=good"
+
+
+def test_successful_verification_saves(cookie_file):
+    rk = RokuSmartHome(cookie_file)
+    rk._fetch_leaves = lambda: []
+    assert rk.import_cookie_header("ks.session=new", verify=True) == 1
+    assert json.loads(cookie_file.read_text()) == {"ks.session": "new"}
+
+
+@pytest.mark.parametrize("content", ["{not json", "[1, 2]", '{"ks.session": 5}', ""])
+def test_corrupt_cookie_file_reports_session_expired(cookie_file, content):
+    from roku_smarthome import SessionExpired
+    cookie_file.write_text(content)
+    rk = RokuSmartHome(cookie_file)  # must not crash
     assert not rk.has_session
+    with pytest.raises(SessionExpired) as exc:
+        rk.raw_devices()
+    assert "Cookie file" in str(exc.value) and "login" in str(exc.value)
+    # and logging in again repairs it
+    rk.import_cookie_header("ks.session=abc")
+    assert RokuSmartHome(cookie_file).has_session
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permissions only")
+def test_cookie_file_is_never_world_readable(cookie_file, monkeypatch):
+    # The file must be created private, not made private after writing.
+    modes = []
+    real_open = os.open
+
+    def spy_open(path, flags, mode=0o777, *args, **kwargs):
+        if str(path).startswith(str(cookie_file)):
+            modes.append(mode)
+        return real_open(path, flags, mode, *args, **kwargs)
+    monkeypatch.setattr(os, "open", spy_open)
+    RokuSmartHome(cookie_file).import_cookie_header("ks.session=abc")
+    assert modes and all(m == 0o600 for m in modes)
+    assert not (cookie_file.parent / (cookie_file.name + ".tmp")).exists()
 
 
 def test_cookies_are_saved_and_reloaded(cookie_file):

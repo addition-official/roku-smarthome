@@ -1,3 +1,5 @@
+import copy
+
 import pytest
 
 from roku_smarthome import RokuSmartHome
@@ -50,7 +52,7 @@ def client(cookie_file):
 
     def fake_fetch():
         rk.fetch_count += 1
-        return [dict(leaf) for leaf in rk.fake_leaves]
+        return copy.deepcopy(rk.fake_leaves)
 
     def fake_send(device, command, parameters, wait=None):
         rk.sent.append((device.id, command, parameters))

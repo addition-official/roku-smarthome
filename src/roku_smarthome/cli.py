@@ -75,10 +75,9 @@ def main(argv=None):
     try:
         if args.cmd == "login":
             header = args.cookie_header or input("Paste Cookie header value: ").strip()
-            n = rk.import_cookie_header(header)
-            print(f"Saved {n} cookies to {rk.cookie_file}")
-            rk.devices()  # verify it works
-            print("Login verified.")
+            # checked against Roku before saving; a bad paste keeps the old login
+            n = rk.import_cookie_header(header, verify=True)
+            print(f"Login verified. Saved {n} cookies to {rk.cookie_file}")
             return
 
         if args.cmd == "status":
