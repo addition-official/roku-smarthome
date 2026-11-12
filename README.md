@@ -71,7 +71,7 @@ roku-smarthome --cookies PATH status                    # use a different cookie
 
 Device names are matched case-insensitively against the names in the Roku Smart Home app, and you can shorten them to any part that only one device has: `roku-smarthome on porch` works for "Porch Camera". If a short name matches several devices, the error lists them.
 
-Exit codes, for scripts and cron jobs: `0` OK, `1` error (unknown device, bad value, unsupported command), `2` bad arguments, `3` session expired (run `login` again), `4` Roku unreachable (retry later).
+Exit codes, for scripts and cron jobs: `0` OK, `1` error (unknown device, bad value, unsupported command), `2` bad arguments, `3` session expired (run `login` again), `4` Roku unreachable (retry later), `5` Roku received the command but reported that it failed.
 
 In Python, `rk.find("porch")` does the same forgiving lookup; `rk.get(name)` still requires the exact name, and refuses to guess if two devices share it (use `rk.get(id, by_id=True)` then).
 
@@ -118,7 +118,9 @@ with RokuSmartHome() as rk:
 
 Pass `persistent=False` to go back to one connection per command (the behavior before 0.2.3).
 
-Exceptions: `SessionExpired` (saved cookie no longer works; run `login` again), `RokuUnavailable` (Roku's API unreachable or erroring; retry later), `DeviceNotFound`, and `UnsupportedCommand` (raised instead of silently sending a command the device doesn't list).
+Exceptions: `SessionExpired` (saved cookie no longer works; run `login` again), `RokuUnavailable` (Roku's API unreachable or erroring, or no reply to a command; retry later), `CommandFailed` (Roku received the command and reported an error, e.g. `failed to execute command`), `DeviceNotFound`, and `UnsupportedCommand` (raised instead of sending a command the device doesn't list).
+
+Each command waits for Roku's reply (usually 0.1 to 2 seconds) so failures are reported. Pass `confirm=False` to `RokuSmartHome()`, or to a single `send()`, to skip that, for example for a brightness slider.
 
 ## Keeping it logged in
 
@@ -146,7 +148,7 @@ The Roku Smart Home line is Wyze hardware sold under the Roku brand, but the dev
 - **Unofficial.** Roku could change or remove these endpoints at any time. If `status` starts failing with something other than `SESSION EXPIRED`, that's probably what happened; please open an issue with the error (and the cookie value removed).
 - **Cameras** are listed with name and online state only. Streams, events and settings are visible in the API but not implemented here.
 - **RGB color** was implemented from Roku's web app without a color bulb to test on, and has since been confirmed working by a user ([#1](https://github.com/addition-official/roku-smarthome/issues/1)). The parameter shape is `{"colorType": "rgb", "rgb": [r, g, b]}`, each 0 to 255.
-- Commands are fire-and-forget over the websocket: if Roku replies with an error, it isn't reported yet. Call `refresh()` if you need to confirm the new state.
+- A command Roku confirms has been accepted by Roku's cloud; the device itself acts a moment later. Call `refresh()` if you need to see the new state.
 - `toggle()` flips based on the state the `Device` object last saw. If something else may have changed the device, call `refresh()` first.
 - The shared connection is only tested against a local fake server so far, not real Roku hardware. If commands start failing after a period of inactivity, try `persistent=False` and please open an issue.
 

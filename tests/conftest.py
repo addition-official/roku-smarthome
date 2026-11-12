@@ -54,7 +54,7 @@ def client(cookie_file):
         rk.fetch_count += 1
         return copy.deepcopy(rk.fake_leaves)
 
-    def fake_send(device, command, parameters, wait=None):
+    def fake_send(device, command, parameters, wait=None, confirm=None):
         rk.sent.append((device.id, command, parameters))
         rk.invalidate()
 

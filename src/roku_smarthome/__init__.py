@@ -5,6 +5,7 @@ from .client import (
     UnsupportedCommand,
     DeviceNotFound,
     RokuUnavailable,
+    CommandFailed,
 )
 
 __all__ = [
@@ -14,5 +15,6 @@ __all__ = [
     "UnsupportedCommand",
     "DeviceNotFound",
     "RokuUnavailable",
+    "CommandFailed",
 ]
-__version__ = "0.2.3"
+__version__ = "0.2.3"

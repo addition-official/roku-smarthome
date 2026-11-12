@@ -119,6 +119,16 @@ class DeviceNotFound(Exception):
     """No device on the account matches that name or id."""
 
 
+class CommandFailed(Exception):
+    """Roku received the command and reported that it failed, e.g. "failed to
+    execute command" for a bad value or "forbidden request" for a device that
+    isn't on the account. `reply` holds Roku's message."""
+
+    def __init__(self, message: str, reply: Optional[dict] = None):
+        super().__init__(message)
+        self.reply = reply
+
+
 class Device:
     """One Roku Smart Home device ("leaf" in Roku's API)."""
 
@@ -168,14 +178,18 @@ class Device:
 
     # ----- commands -----
 
-    def send(self, command: str, parameters: dict, wait: Optional[float] = None):
-        """Send any command. Raises UnsupportedCommand if the device doesn't list it."""
+    def send(self, command: str, parameters: dict, wait: Optional[float] = None,
+             confirm: Optional[bool] = None) -> Optional[dict]:
+        """Send any command. Raises UnsupportedCommand if the device doesn't list it.
+        With confirmation on (the client default), waits for Roku's reply and
+        raises CommandFailed if Roku reports an error; returns the reply."""
         if command not in self.supported_commands:
             raise UnsupportedCommand(
                 f"{self.name!r} does not support {command!r} "
                 f"(supports: {sorted(self.supported_commands)})"
             )
-        self._client._send_command(self, command, parameters, wait=wait)
+        return self._client._send_command(self, command, parameters, wait=wait,
+                                          confirm=confirm)
 
     def turn_on(self):
         self.send("power", {"power": "on"})
@@ -231,6 +245,11 @@ class RokuSmartHome:
                   False opens a new connection per command (the pre-0.2.3 behavior).
     idle_timeout  with persistent=True, close the websocket after this many seconds
                   without a command; the next command reopens it. 0 = never.
+    confirm       wait for Roku's reply to each command and raise CommandFailed if
+                  it reports an error (default). False sends without waiting, a
+                  little faster for rapid-fire commands like a slider.
+    reply_timeout with confirm=True, seconds to wait for Roku's reply before raising
+                  RokuUnavailable. Replies usually take 0.1 to 2 seconds.
     command_wait  seconds a connection must stay open after the last command
                   before it is closed. Roku drops a command if the connection
                   closes right after it, so keep this around 0.5.
@@ -242,13 +261,16 @@ class RokuSmartHome:
     def __init__(self, cookie_file: Optional[os.PathLike] = None, *,
                  timeout: float = 10.0, cache_ttl: float = 0.0,
                  command_wait: float = 0.5, persistent: bool = True,
-                 idle_timeout: float = 60.0):
+                 idle_timeout: float = 60.0, confirm: bool = True,
+                 reply_timeout: float = 5.0):
         self.cookie_file = Path(cookie_file) if cookie_file else DEFAULT_COOKIE_FILE
         self.timeout = float(timeout)
         self.cache_ttl = float(cache_ttl)
         self.command_wait = float(command_wait)
         self.persistent = bool(persistent)
         self.idle_timeout = float(idle_timeout)
+        self.confirm = bool(confirm)
+        self.reply_timeout = float(reply_timeout)
         self.socket_url = SOCKET_URL
 
         self._cache_lock = threading.Lock()
@@ -264,6 +286,7 @@ class RokuSmartHome:
         self._idle_handle: Optional[asyncio.TimerHandle] = None
         self._connects = 0  # connections opened, for tests and debugging
         self._last_send = 0.0  # loop time of the last command on self._ws
+        self._pending: Dict[str, tuple] = {}  # command id -> (websocket, Future)
 
         atexit.register(_close_at_exit, weakref.ref(self))
 
@@ -481,7 +504,8 @@ class RokuSmartHome:
     # ----- commands -----
 
     def _send_command(self, device: Device, command: str, parameters: dict,
-                      wait: Optional[float] = None):
+                      wait: Optional[float] = None,
+                      confirm: Optional[bool] = None) -> Optional[dict]:
         msg = {
             "id": str(uuid.uuid4()),
             "type": "send_command",
@@ -491,14 +515,41 @@ class RokuSmartHome:
                 "command": {"command": command, "parameters": parameters},
             },
         }
+        confirm = self.confirm if confirm is None else bool(confirm)
+        reply_wait = self.reply_timeout if confirm else 0.0
         if self.persistent:
             # worst case: a send on a dead connection, then a fresh connect
-            self._run(self._ws_send_persistent(msg), timeout=2 * self.timeout + 2)
+            reply = self._run(self._ws_send_persistent(msg, confirm),
+                              timeout=2 * self.timeout + reply_wait + 2)
         else:
             w = self.command_wait if wait is None else float(wait)
-            self._run(self._ws_send_once(msg, w), timeout=self.timeout + w + 2)
-        # state changed on Roku's side; don't serve the stale list again
+            reply = self._run(self._ws_send_once(msg, w, confirm),
+                              timeout=self.timeout + max(w, reply_wait) + 2)
+        # state may have changed on Roku's side; don't serve the stale list again
         self.invalidate()
+        if reply is not None and reply.get("error"):
+            raise CommandFailed(
+                f"Roku could not run {command!r} on {device.name or device.id!r}: "
+                f"{reply['error']}", reply)
+        return reply
+
+    @staticmethod
+    def _reply_to(raw, command_id: str) -> Optional[dict]:
+        """Roku's reply to command `command_id` if `raw` is one: send_command_resp
+        on success, or send_command with an "error" field on failure."""
+        try:
+            m = json.loads(raw)
+        except (TypeError, ValueError):
+            return None
+        if (isinstance(m, dict) and m.get("id") == command_id
+                and m.get("type") in ("send_command_resp", "send_command")):
+            return m
+        return None
+
+    def _no_reply(self) -> RokuUnavailable:
+        return RokuUnavailable(
+            f"Roku did not confirm the command within {self.reply_timeout:g} s; "
+            "it may or may not have been applied")
 
     # ----- websocket plumbing (runs on the event loop thread) -----
 
@@ -520,28 +571,46 @@ class RokuSmartHome:
         self._connects += 1
         return ws
 
-    async def _ws_send_once(self, msg: dict, wait: float):
-        """Open a connection, send one command, linger `wait` seconds, close."""
+    async def _ws_send_once(self, msg: dict, wait: float, confirm: bool):
+        """Open a connection, send one command, then either wait for Roku's
+        reply (confirm) or linger `wait` seconds so Roku processes it; close."""
         ws = await self._ws_open()
         try:
             try:
                 await ws.send(json.dumps(msg))
             except (OSError, websockets.exceptions.WebSocketException) as e:
                 raise RokuUnavailable(f"websocket error: {e}") from e
-            # The command is sent. Server chats on connect (init / stream_init /
-            # leaves); give it a moment to process the command before we close.
-            # If Roku closes the connection itself meanwhile, that's fine: the
-            # command was already delivered, so don't report a failure.
-            deadline = asyncio.get_running_loop().time() + wait
+            # Server chats on connect (init / stream_init / leaves); skip that.
+            loop = asyncio.get_running_loop()
+            sent_at = loop.time()
+            deadline = sent_at + (self.reply_timeout if confirm else wait)
             while True:
-                remaining = deadline - asyncio.get_running_loop().time()
+                remaining = deadline - loop.time()
                 if remaining <= 0:
                     break
                 try:
-                    await asyncio.wait_for(ws.recv(), timeout=remaining)
-                except (asyncio.TimeoutError, OSError,
-                        websockets.exceptions.WebSocketException):
+                    raw = await asyncio.wait_for(ws.recv(), timeout=remaining)
+                except asyncio.TimeoutError:
                     break
+                except (OSError, websockets.exceptions.WebSocketException) as e:
+                    if confirm:
+                        raise RokuUnavailable(
+                            "connection closed before Roku confirmed the command; "
+                            "it may or may not have been applied") from e
+                    # Unconfirmed: the command was already delivered, so a close
+                    # by Roku isn't a failure (a retry would send it twice).
+                    break
+                if confirm:
+                    reply = self._reply_to(raw, msg["id"])
+                    if reply is not None:
+                        # still give the device the full wait before closing
+                        linger = sent_at + wait - loop.time()
+                        if linger > 0:
+                            await asyncio.sleep(linger)
+                        return reply
+            if confirm:
+                raise self._no_reply()
+            return None
         finally:
             await ws.close()
 
@@ -550,37 +619,74 @@ class RokuSmartHome:
             self._ws_lock = asyncio.Lock()
         return self._ws_lock
 
-    async def _ws_send_persistent(self, msg: dict):
+    async def _ws_send_persistent(self, msg: dict, confirm: bool) -> Optional[dict]:
         """Send over the shared connection, opening it if needed. If the
-        connection turns out to be dead, reconnect and resend once."""
+        connection turns out to be dead, reconnect and resend once. With
+        confirm, then wait (outside the lock) for Roku's reply."""
         data = json.dumps(msg)
-        async with self._lock():
-            for attempt in (1, 2):
-                fresh = self._ws is None or self._ws.state is not State.OPEN
-                if fresh:
-                    await self._ws_drop()
-                    self._ws = await self._ws_open()
-                    asyncio.get_running_loop().create_task(self._ws_reader(self._ws))
-                try:
-                    await self._ws.send(data)
-                    self._last_send = asyncio.get_running_loop().time()
-                    break
-                except (OSError, websockets.exceptions.ConnectionClosed) as e:
-                    await self._ws_drop()
-                    if fresh or attempt == 2:
-                        raise RokuUnavailable(f"websocket error: {e}") from e
-            self._arm_idle_timer()
+        cid = msg["id"]
+        loop = asyncio.get_running_loop()
+        fut = loop.create_future() if confirm else None
+        try:
+            async with self._lock():
+                for attempt in (1, 2):
+                    fresh = self._ws is None or self._ws.state is not State.OPEN
+                    if fresh:
+                        await self._ws_drop()
+                        self._ws = await self._ws_open()
+                        loop.create_task(self._ws_reader(self._ws))
+                    if fut is not None:
+                        self._pending[cid] = (self._ws, fut)
+                    try:
+                        await self._ws.send(data)
+                        # Even a confirmed command gets the full wait before a
+                        # close: Roku's reply can arrive before the device acts.
+                        self._last_send = loop.time()
+                        break
+                    except (OSError, websockets.exceptions.ConnectionClosed) as e:
+                        self._pending.pop(cid, None)
+                        await self._ws_drop()
+                        if fresh or attempt == 2:
+                            raise RokuUnavailable(f"websocket error: {e}") from e
+                self._arm_idle_timer()
+            if fut is None:
+                return None
+            try:
+                return await asyncio.wait_for(fut, timeout=self.reply_timeout)
+            except asyncio.TimeoutError:
+                raise self._no_reply() from None
+        finally:
+            self._pending.pop(cid, None)
 
     async def _ws_reader(self, ws):
-        # Keep reading so the server's chatter can't fill the receive buffer;
-        # a full buffer stops ping/pong processing and the connection dies.
+        # Keep reading so the server's chatter can't fill the receive buffer
+        # (a full buffer stops ping/pong processing and the connection dies),
+        # and hand Roku's replies to the commands waiting for them.
         try:
-            async for _ in ws:
-                pass
+            async for raw in ws:
+                self._dispatch_reply(raw)
         except Exception:
             pass
         if self._ws is ws:
             self._ws = None
+        for cid, (owner, fut) in list(self._pending.items()):
+            if owner is ws and not fut.done():
+                fut.set_exception(RokuUnavailable(
+                    "connection closed before Roku confirmed the command; "
+                    "it may or may not have been applied"))
+
+    def _dispatch_reply(self, raw):
+        try:
+            m = json.loads(raw)
+        except (TypeError, ValueError):
+            return
+        if not isinstance(m, dict):
+            return
+        entry = self._pending.get(m.get("id"))
+        if entry is not None and m.get("type") in ("send_command_resp", "send_command"):
+            fut = entry[1]
+            if not fut.done():
+                fut.set_result(m)
 
     def _arm_idle_timer(self):
         if self._idle_handle is not None:

@@ -2,13 +2,15 @@ import argparse
 import json
 import sys
 
-from .client import RokuSmartHome, SessionExpired, RokuUnavailable, UnsupportedCommand, DeviceNotFound
+from .client import (RokuSmartHome, SessionExpired, RokuUnavailable, UnsupportedCommand,
+                     DeviceNotFound, CommandFailed)
 
 # Exit codes, so scripts and cron jobs can tell failures apart.
 # (2 is argparse's code for a bad command line.)
 EXIT_ERROR = 1            # bad input, unknown device, unsupported command
 EXIT_SESSION_EXPIRED = 3  # saved login no longer works: run `login` again
 EXIT_UNAVAILABLE = 4      # Roku unreachable or erroring: retry later
+EXIT_COMMAND_FAILED = 5   # Roku received the command and reported an error
 
 
 def parse_color(values):
@@ -43,7 +45,8 @@ def main(argv=None):
     p.epilog = ("Device names can be shortened to any unique part of the name, "
                 "e.g. 'porch' for 'Porch Camera'. "
                 "Exit codes: 0 ok, 1 error, 2 bad arguments, "
-                "3 session expired (run login), 4 Roku unavailable (retry later).")
+                "3 session expired (run login), 4 Roku unavailable (retry later), "
+                "5 Roku reported the command failed.")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     sp = sub.add_parser("login", help="save a Cookie header copied from my.roku.com/smarthome")
@@ -116,6 +119,8 @@ def main(argv=None):
         fail(f"SESSION EXPIRED: {e}", EXIT_SESSION_EXPIRED)
     except RokuUnavailable as e:
         fail(f"ROKU UNAVAILABLE: {e}", EXIT_UNAVAILABLE)
+    except CommandFailed as e:
+        fail(f"COMMAND FAILED: {e}", EXIT_COMMAND_FAILED)
     except (DeviceNotFound, UnsupportedCommand, ValueError) as e:
         fail(f"Error: {e}", EXIT_ERROR)
     finally:

@@ -14,6 +14,7 @@ Nothing yet.
 - `rgb` accepts hex colors: `roku-smarthome rgb "Color bulb" "#ff8000"`.
 - Separate CLI exit codes: 1 error, 2 bad arguments, 3 session expired, 4 Roku unavailable.
 - `login` accepts a whole "Copy as cURL" line or a `Cookie:` prefix.
+- Commands wait for Roku's reply and raise the new `CommandFailed` if Roku reports an error (CLI exit code 5). A missing reply raises `RokuUnavailable`. `confirm=False` skips the wait.
 
 ### Fixed
 - A bad or empty paste at `login` overwrote the saved session. The cookie is now checked against Roku before it's saved.

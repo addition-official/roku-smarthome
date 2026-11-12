@@ -13,7 +13,7 @@ from websockets.datastructures import Headers
 from websockets.http11 import Response
 from websockets.protocol import State
 
-from roku_smarthome import Device, RokuSmartHome, RokuUnavailable, SessionExpired
+from roku_smarthome import CommandFailed, Device, RokuSmartHome, RokuUnavailable, SessionExpired
 
 from conftest import make_leaf
 
@@ -23,6 +23,10 @@ class FakeRoku:
 
     reject_with   HTTP status to refuse the handshake with (e.g. 403)
     chatter       messages to send to each new client, like Roku's init burst
+    reply         how to answer each command, like real Roku: "ok" sends
+                  send_command_resp, any other string is sent back as an error,
+                  None sends nothing
+    reply_delay   seconds before replying
     process_delay like real Roku, a command only takes effect (lands in
                   `processed`) if the connection is still open this long after
                   it arrives; closing right after sending loses it
@@ -34,6 +38,8 @@ class FakeRoku:
         self.received = []
         self.processed = []
         self.custom_handler = None  # replaces the default behavior if set
+        self.reply = "ok"
+        self.reply_delay = 0.0
         self.process_delay = 0.3
         self.connections = 0
         self.headers = []
@@ -72,8 +78,24 @@ class FakeRoku:
                 msg = json.loads(message)
                 self.received.append(msg)
                 asyncio.get_running_loop().create_task(self._process(ws, msg))
+                asyncio.get_running_loop().create_task(self._reply(ws, msg))
         finally:
             self._clients.discard(ws)
+
+    async def _reply(self, ws, msg):
+        if self.reply is None:
+            return
+        await asyncio.sleep(self.reply_delay)
+        if self.reply == "ok":
+            answer = {"id": msg["id"], "type": "send_command_resp"}
+        else:
+            answer = {"id": msg["id"], "type": "send_command", "error": self.reply}
+        try:
+            # unrelated push message first, as Roku does
+            await ws.send(json.dumps({"type": "leaf_state_report", "payload": []}))
+            await ws.send(json.dumps(answer))
+        except Exception:
+            pass
 
     async def _process(self, ws, msg):
         await asyncio.sleep(self.process_delay)
@@ -369,7 +391,7 @@ def test_server_closing_after_delivered_command_is_not_an_error(make_client, ser
             server.received.append(json.loads(message))
             await ws.close()
     server.custom_handler = close_after_first_message
-    rk, bulb = make_client(persistent=False, command_wait=1)
+    rk, bulb = make_client(persistent=False, command_wait=1, confirm=False)
     bulb.turn_on()
     assert len(server.wait_for_messages(1)) == 1
 
@@ -381,8 +403,123 @@ def test_persistent_server_close_after_command_is_not_an_error(make_client, serv
             server.received.append(json.loads(message))
             await ws.close()
     server.custom_handler = close_after_first_message
-    rk, bulb = make_client()
+    rk, bulb = make_client(confirm=False)
     bulb.turn_on()          # delivered, then the server closes
     time.sleep(0.2)
     bulb.turn_off()         # must reconnect, not fail
     assert len(server.wait_for_messages(2)) == 2
+
+
+
+# ----- confirmation of commands (Roku's replies) -----
+
+@pytest.mark.parametrize("persistent", [True, False])
+def test_confirmed_command_returns_roku_reply(make_client, server, persistent):
+    rk, bulb = make_client(persistent=persistent)
+    reply = bulb.send("power", {"power": "on"})
+    assert reply["type"] == "send_command_resp"
+    assert reply["id"] == server.received[0]["id"]
+
+
+@pytest.mark.parametrize("persistent", [True, False])
+@pytest.mark.parametrize("error", ["failed to execute command", "forbidden request"])
+def test_roku_error_raises_command_failed(make_client, server, persistent, error):
+    server.reply = error
+    rk, bulb = make_client(persistent=persistent)
+    bulb.power = "off"
+    with pytest.raises(CommandFailed) as exc:
+        bulb.turn_on()
+    assert error in str(exc.value)
+    assert exc.value.reply["error"] == error
+    assert bulb.power == "off"  # local state not updated on failure
+
+
+@pytest.mark.parametrize("persistent", [True, False])
+def test_no_reply_times_out(make_client, server, persistent):
+    server.reply = None
+    rk, bulb = make_client(persistent=persistent, reply_timeout=0.3)
+    start = time.monotonic()
+    with pytest.raises(RokuUnavailable) as exc:
+        bulb.turn_on()
+    assert "did not confirm" in str(exc.value)
+    assert time.monotonic() - start < 3
+
+
+@pytest.mark.parametrize("persistent", [True, False])
+def test_connection_closed_before_reply(make_client, server, persistent):
+    async def close_without_reply(ws):
+        server.connections += 1
+        async for message in ws:
+            server.received.append(json.loads(message))
+            await ws.close()
+    server.custom_handler = close_without_reply
+    rk, bulb = make_client(persistent=persistent)
+    with pytest.raises(RokuUnavailable) as exc:
+        bulb.turn_on()
+    assert "before Roku confirmed" in str(exc.value)
+
+
+def test_slow_reply_still_confirms(make_client, server):
+    server.reply_delay = 1.0  # the bad-value reply took 1.8 s on real Roku
+    rk, bulb = make_client()
+    assert bulb.send("power", {"power": "on"})["type"] == "send_command_resp"
+
+
+def test_replies_are_matched_to_the_right_command(make_client, server):
+    # Many threads at once: each must get the reply to its own command.
+    rk, _ = make_client()
+    results, errors = {}, []
+
+    def worker(level):
+        try:
+            results[level] = Device(rk, make_leaf()).send("brightness", {"level": level})
+        except Exception as e:  # pragma: no cover
+            errors.append(e)
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(15)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert errors == []
+    sent_ids = {m["payload"]["command"]["parameters"]["level"]: m["id"] for m in server.received}
+    assert {lvl: r["id"] for lvl, r in results.items()} == sent_ids
+
+
+def test_confirm_can_be_turned_off_per_command(make_client, server):
+    server.reply = None  # would time out if we waited
+    rk, bulb = make_client(reply_timeout=0.3)
+    assert bulb.send("power", {"power": "on"}, confirm=False) is None
+
+
+def test_confirmed_command_still_waits_before_close(make_client, server):
+    # Roku's reply can come before the device has acted (on real hardware the
+    # state update arrived 0.7 s after the reply), so closing still waits.
+    server.process_delay = 0.4
+    rk, bulb = make_client()
+    bulb.turn_on()          # reply arrives immediately
+    rk.close()
+    assert len(server.wait_for_processed(1)) == 1
+
+
+@pytest.mark.parametrize("persistent", [True, False])
+def test_reply_before_processing_does_not_lose_command(make_client, server, persistent):
+    server.process_delay = 0.4
+    rk, bulb = make_client(persistent=persistent)
+    bulb.turn_on()
+    rk.close()
+    assert len(server.wait_for_processed(1)) == 1
+
+
+def test_cli_reports_command_failed(server, cookie_file, monkeypatch, capsys):
+    from roku_smarthome import cli
+    server.reply = "failed to execute command"
+    rk = RokuSmartHome(cookie_file, timeout=3)
+    rk.import_cookie_header("ks.session=abc")
+    rk.socket_url = server.url
+    rk._fetch_leaves = lambda: [make_leaf()]
+    monkeypatch.setattr(cli, "RokuSmartHome", lambda cookies=None: rk)
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["on", "bedroom"])
+    assert exc.value.code == cli.EXIT_COMMAND_FAILED
+    assert "COMMAND FAILED" in capsys.readouterr().err
