@@ -13,11 +13,11 @@ pip install . pytest
 python -m pytest
 ```
 
-### 2. Reuse one connection for commands - done (needs hardware testing)
+### 2. Reuse one connection for commands - done
 
 The client now keeps one websocket open and reuses it (`persistent=True`, the default). A background reader keeps the connection healthy, it reconnects and resends once if the connection has dropped, and it closes after `idle_timeout` seconds without a command (60 by default) and at interpreter exit. `persistent=False` restores the old one-connection-per-command behavior. Covered by `tests/test_websocket.py` against a local fake server.
 
-Still to check on real devices: that Roku accepts several commands on one connection, and how long it keeps an idle connection open.
+Confirmed on a real plug: several commands on one connection, a connection left idle for 90 seconds, and commands right before the program exits (which needed the 0.5 s wait before closing).
 
 ### 3. Check color temperature values - done
 
@@ -33,9 +33,9 @@ Still to check on real devices: that Roku accepts several commands on one connec
 
 Captured on real hardware: Roku answers every command with a message carrying the command's `id`, either `{"type": "send_command_resp"}` on success or `{"type": "send_command", "error": "..."}` on failure ("failed to execute command" for a bad value or unsupported command, "forbidden request" for a device that isn't on the account). Commands now wait for that reply (`confirm=True`, the default) and raise `CommandFailed` on an error.
 
-### 6. Live state updates - done (needs hardware testing)
+### 6. Live state updates - done
 
-`rk.on_change(callback)` listens for Roku's `leaf_state_report` pushes, merges the changed state onto the full device details from the REST list, and calls the callback with a `Device` on a separate thread. Reconnects with backoff and reports changes missed while offline. `roku-smarthome watch` prints them. Still to confirm on real devices: which id the reports use (the leaf id or the device serial; both are matched) and how long Roku keeps a listening connection open.
+`rk.on_change(callback)` listens for Roku's `leaf_state_report` pushes, merges the changed state onto the full device details from the REST list, and calls the callback with a `Device` on a separate thread. Reconnects with backoff and reports changes missed while offline. `roku-smarthome watch` prints them. Confirmed on a real plug: changes made from the CLI and from Google Assistant both arrive.
 
 ### 7. Scenes
 
