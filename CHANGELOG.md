@@ -4,7 +4,12 @@ What changed in each release on [PyPI](https://pypi.org/project/roku-smarthome/)
 
 ## Unreleased
 
+Nothing yet.
+
+## 0.3.1
+
 - README: the shared connection and live updates are tested on real hardware, not only a fake server.
+- GitHub Actions updated to versions that run on Node 24 (Node 20 is being retired). No code changes.
 
 ## 0.3.0
 
