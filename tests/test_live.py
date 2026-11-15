@@ -228,3 +228,17 @@ def test_cli_watch_prints_changes(rk, server, monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "Watching for changes" in out
     assert "Living Room Plug" in out and "ON" in out
+
+
+def test_cli_watch_exits_3_when_login_expires(rk, server, monkeypatch, capsys):
+    import threading as _t
+    monkeypatch.setattr(cli, "RokuSmartHome", lambda cookies=None: rk)
+
+    def expire():
+        server.wait_for_clients()
+        time.sleep(0.3)
+        rk._live_error = SessionExpired("x")
+    _t.Thread(target=expire).start()
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["watch", "--seconds", "20"])
+    assert exc.value.code == cli.EXIT_SESSION_EXPIRED

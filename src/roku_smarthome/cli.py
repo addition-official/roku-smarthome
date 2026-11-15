@@ -1,6 +1,10 @@
 import argparse
+import getpass
 import json
+import math
+import os
 import sys
+import threading
 import time
 
 from .client import (RokuSmartHome, SessionExpired, RokuUnavailable, UnsupportedCommand,
@@ -12,6 +16,7 @@ EXIT_ERROR = 1            # bad input, unknown device, unsupported command
 EXIT_SESSION_EXPIRED = 3  # saved login no longer works: run `login` again
 EXIT_UNAVAILABLE = 4      # Roku unreachable or erroring: retry later
 EXIT_COMMAND_FAILED = 5   # Roku received the command and reported an error
+EXIT_INTERRUPTED = 130    # Ctrl-C (the shell convention: 128 + SIGINT)
 
 
 def parse_color(values):
@@ -34,6 +39,22 @@ def parse_color(values):
     raise ValueError("give a hex color like #ff8000 or three numbers like 255 128 0")
 
 
+def printable(text) -> str:
+    """Device names come from the account; don't let control characters
+    (e.g. terminal escape sequences) reach the terminal."""
+    return "".join(c if c.isprintable() else "?" for c in str(text))
+
+
+def positive_seconds(value):
+    try:
+        f = float(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not a number: {value!r}") from None
+    if not math.isfinite(f) or f <= 0:
+        raise argparse.ArgumentTypeError(f"must be a positive number of seconds, got {value!r}")
+    return f
+
+
 def describe(d):
     extra = ""
     if d.brightness is not None:
@@ -42,7 +63,7 @@ def describe(d):
         extra += f" {d.color_temp}K"
     if d.color_rgb:
         extra += f" rgb{tuple(d.color_rgb)}"
-    return (f"{d.name:32} {d.type:8} {(d.power or '?').upper():4} "
+    return (f"{printable(d.name):32} {printable(d.type):8} {(d.power or '?').upper():4} "
             f"({'online' if d.online else 'OFFLINE'}){extra}")
 
 
@@ -51,25 +72,56 @@ def fail(message, code):
     sys.exit(code)
 
 
+def _quiet_stdout():
+    """Output was closed (e.g. piped into `head`): stop writing to it without
+    an error at exit."""
+    try:
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(devnull, sys.stdout.fileno())
+    except (OSError, ValueError, AttributeError):
+        pass
+
+
 def main(argv=None):
+    # A terminal that can't show a device's emoji gets a "?" instead of an
+    # error after the command already ran.
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            try:
+                stream.reconfigure(errors="replace")
+            except (ValueError, OSError):
+                pass
+    try:
+        _main(argv)
+    except BrokenPipeError:
+        _quiet_stdout()
+    except KeyboardInterrupt:
+        print("Interrupted.", file=sys.stderr)
+        sys.exit(EXIT_INTERRUPTED)
+
+
+def _main(argv=None):
     p = argparse.ArgumentParser(prog="roku-smarthome",
                                 description="Control Roku Smart Home devices.")
-    p.add_argument("--cookies", help="path to cookie file (default: ~/.config/roku-smarthome/cookies.json)")
+    p.add_argument("--cookies", help="path to cookie file (default: $ROKU_SMARTHOME_COOKIES, "
+                                     "or ~/.config/roku-smarthome/cookies.json)")
     p.epilog = ("Device names can be shortened to any unique part of the name, "
                 "e.g. 'porch' for 'Porch Camera'. "
                 "Exit codes: 0 ok, 1 error, 2 bad arguments, "
                 "3 session expired (run login), 4 Roku unavailable (retry later), "
-                "5 Roku reported the command failed.")
+                "5 Roku reported the command failed, 130 interrupted (Ctrl-C).")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     sp = sub.add_parser("login", help="save a Cookie header copied from my.roku.com/smarthome")
-    sp.add_argument("cookie_header", nargs="?", help="omit to be prompted")
+    sp.add_argument("cookie_header", nargs="?",
+                    help="omit to be prompted (recommended: a cookie on the command "
+                         "line ends up in your shell history)")
 
     sub.add_parser("status", help="list devices and state")
     sub.add_parser("json", help="dump raw device list as JSON")
 
     sp = sub.add_parser("watch", help="print device changes as they happen (Ctrl-C to stop)")
-    sp.add_argument("--seconds", type=float, help="stop after this many seconds")
+    sp.add_argument("--seconds", type=positive_seconds, help="stop after this many seconds")
 
     for name in ("on", "off", "toggle"):
         sp = sub.add_parser(name)
@@ -89,13 +141,23 @@ def main(argv=None):
                     help="hex like '#ff8000', or three numbers 0-255 like 255 128 0")
 
     args = p.parse_args(argv)
-    rk = RokuSmartHome(args.cookies)
+    rk = RokuSmartHome(os.path.expanduser(args.cookies) if args.cookies else None)
 
     try:
         if args.cmd == "login":
-            header = args.cookie_header or input("Paste Cookie header value: ").strip()
+            header = args.cookie_header
+            if header is None:
+                try:
+                    # not echoed, so the cookie doesn't stay on screen
+                    header = getpass.getpass("Paste Cookie header value (hidden): ").strip()
+                except EOFError:
+                    fail("Error: no cookie given (input was closed)", EXIT_ERROR)
             # checked against Roku before saving; a bad paste keeps the old login
-            n = rk.import_cookie_header(header, verify=True)
+            try:
+                n = rk.import_cookie_header(header, verify=True)
+            except OSError as e:
+                fail(f"Error: could not save the login to {rk.cookie_file}: "
+                     f"{e.strerror or e}", EXIT_ERROR)
             print(f"Login verified. Saved {n} cookies to {rk.cookie_file}")
             return
 
@@ -105,17 +167,29 @@ def main(argv=None):
             return
 
         if args.cmd == "watch":
-            rk.on_change(lambda d: print(f"{time.strftime('%H:%M:%S')}  {describe(d)}",
-                                         flush=True))
+            output_closed = threading.Event()
+
+            def show(d):
+                if output_closed.is_set():
+                    return
+                try:
+                    print(f"{time.strftime('%H:%M:%S')}  {describe(d)}", flush=True)
+                except (BrokenPipeError, OSError):
+                    output_closed.set()  # e.g. `watch | head -3` is done
+
+            rk.on_change(show)
             print("Watching for changes (Ctrl-C to stop)...", flush=True)
+            end = None if args.seconds is None else time.monotonic() + args.seconds
             try:
-                if args.seconds is not None:
-                    time.sleep(args.seconds)
-                else:
-                    while True:
-                        time.sleep(3600)
+                while not output_closed.wait(1.0):
+                    if end is not None and time.monotonic() >= end:
+                        break
+                    if isinstance(rk.live_error, SessionExpired):
+                        raise rk.live_error
             except KeyboardInterrupt:
                 pass
+            if output_closed.is_set():
+                _quiet_stdout()
             return
 
         if args.cmd == "json":

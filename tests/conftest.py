@@ -5,6 +5,14 @@ import pytest
 from roku_smarthome import RokuSmartHome
 
 
+@pytest.fixture(autouse=True)
+def never_contact_roku(monkeypatch):
+    """Any client a test forgets to point at a fake server fails fast on a
+    dead local port instead of connecting to Roku's real websocket."""
+    import roku_smarthome.client as client_module
+    monkeypatch.setattr(client_module, "SOCKET_URL", "ws://127.0.0.1:9/never-roku")
+
+
 def make_leaf(**overrides):
     """A device entry shaped like one item from Roku's /leaves response."""
     leaf = {
