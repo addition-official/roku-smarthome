@@ -1,0 +1,4 @@
+# Ship the whole test suite in the sdist (setuptools only picks up
+# tests/test_*.py by default, and they need conftest.py and the helpers).
+recursive-include tests *.py
+include CHANGELOG.md ROADMAP.md

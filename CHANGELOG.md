@@ -4,7 +4,34 @@ What changed in each release on [PyPI](https://pypi.org/project/roku-smarthome/)
 
 ## Unreleased
 
-Nothing yet.
+Fixes from a multi-agent security, edge-case and bug review. Every fix has a regression test that failed before it.
+
+### Fixed
+- Live updates could stop for good, without any message, if the connection dropped again while a reconnect was loading the device list.
+- Subscribing and unsubscribing on two threads at once could leave a callback registered but never called.
+- A server that accepted and then dropped the connection caused a reconnect and a full device-list fetch every ~2 seconds forever. Reconnects now back off to 60 s.
+- After `os.fork()`, every call in the child process hung until it timed out.
+- Closing the connection (idle timeout or `close()`) could cut off a command still waiting for Roku's reply and report it as failed although it ran.
+- A device list fetched during a reconnect could overwrite a newer change and report the old state. A change made while subscribing could be missed.
+- One malformed message from Roku stopped the background reader and left its connection open.
+- `login` with verification could save the rejected cookie to disk if Roku's response wasn't a device list.
+- If saving a renewed cookie failed (e.g. read-only folder), the request failed and the renewal was never saved. Now the request succeeds and the save is retried.
+- Two programs saving the cookie file at the same moment could leave it as invalid JSON. In a shared folder, a file planted by another user could expose the cookie.
+- Roku deleting the session cookie (logout) was undone.
+- Pasted cookies with line breaks or curly quotes broke every request and could print the cookie in error messages; they're now rejected. Whole "Copy as cURL" commands (bash, `$'...'` and Windows cmd quoting) now work.
+- Lookups: numeric ids, names with surrounding spaces, `find("")`, and non-text names from Roku.
+- CLI: `watch | head` never exited; `status | head` and Ctrl-C printed tracebacks; `login` with closed input crashed; a terminal that can't show emoji turned a successful command into an error; device names could send escape sequences to the terminal; `watch --seconds` accepted invalid values.
+- The source package's tests couldn't run (missing `conftest.py`).
+
+### Added
+- `rk.live_error`: why live updates are retrying (e.g. `SessionExpired`), or `None` while connected. `watch` exits with code 3 when the login expires.
+- CLI exit code 130 for Ctrl-C.
+
+### Changed
+- Callbacks fire only when a device's visible state changes, not for reports that only update Roku's internal timestamps.
+- The `login` prompt doesn't show the pasted cookie. Hints no longer suggest putting the cookie on the command line.
+- The `websockets` library's debug logs no longer include the session cookie.
+- Releases run the full test suite and must be tagged on `main`. Tests run on Python 3.10 to 3.14. Building requires setuptools 77+.
 
 ## 0.3.1
 

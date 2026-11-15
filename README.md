@@ -44,7 +44,7 @@ Or clone this repo and `pip install .` to build the exact package that's publish
 roku-smarthome login
 ```
 
-Paste the cookie value when prompted (a whole "Copy as cURL" line or a `Cookie:` prefix is fine too). It's verified against your account before it's saved, so a bad paste keeps your previous login, and it's saved to a per-user file (`%USERPROFILE%\.config\roku-smarthome\cookies.json` on Windows, `~/.config/roku-smarthome/cookies.json` on macOS/Linux). Set `ROKU_SMARTHOME_COOKIES` or pass `--cookies PATH` to use a different location.
+Paste the cookie value when prompted (a whole "Copy as cURL" command or a `Cookie:` prefix is fine too). What you paste isn't shown on screen. Avoid passing the cookie as an argument instead, since it would end up in your shell history. It's verified against your account before it's saved, so a bad paste keeps your previous login, and it's saved to a per-user file (`%USERPROFILE%\.config\roku-smarthome\cookies.json` on Windows, `~/.config/roku-smarthome/cookies.json` on macOS/Linux). Set `ROKU_SMARTHOME_COOKIES` or pass `--cookies PATH` to use a different location.
 
 > **Keep that file private.** It is a working login to your Roku account. Don't share it, and don't paste the cookie into chat windows or bug reports. It's stored outside the project folder, so it can't be committed by accident.
 
@@ -72,7 +72,7 @@ roku-smarthome --cookies PATH status                    # use a different cookie
 
 Device names are matched case-insensitively against the names in the Roku Smart Home app, and you can shorten them to any part that only one device has: `roku-smarthome on porch` works for "Porch Camera". If a short name matches several devices, the error lists them.
 
-Exit codes, for scripts and cron jobs: `0` OK, `1` error (unknown device, bad value, unsupported command), `2` bad arguments, `3` session expired (run `login` again), `4` Roku unreachable (retry later), `5` Roku received the command but reported that it failed.
+Exit codes, for scripts and cron jobs: `0` OK, `1` error (unknown device, bad value, unsupported command), `2` bad arguments, `3` session expired (run `login` again), `4` Roku unreachable (retry later), `5` Roku received the command but reported that it failed, `130` interrupted with Ctrl-C.
 
 In Python, `rk.find("porch")` does the same forgiving lookup; `rk.get(name)` still requires the exact name, and refuses to guess if two devices share it (use `rk.get(id, by_id=True)` then).
 
@@ -134,7 +134,7 @@ stop = rk.on_change(changed)   # keeps the connection open and listens
 stop()                         # or rk.close()
 ```
 
-`device` is a full `Device` with the new state. Callbacks run one at a time on their own thread, so they can send commands. If the connection drops, it reconnects automatically and reports any changes it missed. From the command line, `roku-smarthome watch` prints the same updates.
+`device` is a full `Device` with the new state. Callbacks run one at a time on their own thread, so they can send commands. If the connection drops, it reconnects automatically (waiting 1 s, then 2, 4... up to 60 s between tries) and reports any changes it missed. While it's retrying, `rk.live_error` says why, for example `SessionExpired` if the login needs renewing; it's `None` while connected. From the command line, `roku-smarthome watch` prints the same updates, and exits with code 3 if the login expires.
 
 Exceptions: `SessionExpired` (saved cookie no longer works; run `login` again), `RokuUnavailable` (Roku's API unreachable or erroring, or no reply to a command; retry later), `CommandFailed` (Roku received the command and reported an error, e.g. `failed to execute command`), `DeviceNotFound`, and `UnsupportedCommand` (raised instead of sending a command the device doesn't list).
 
@@ -142,7 +142,7 @@ Each command waits for Roku's reply (usually 0.1 to 2 seconds) so failures are r
 
 ## Keeping it logged in
 
-Every request to Roku's API comes back with a re-issued session cookie carrying a fresh 365-day expiry. This client merges that cookie back into its file on every call. In practice: if anything uses this library at least once a year, the login is permanent. A daily cron entry like
+Every request to Roku's API comes back with a re-issued session cookie carrying a fresh 365-day expiry. This client saves that cookie back into its file whenever it fetches the device list (`status`, `devices()`, `get()`, `find()`, and every CLI command). In practice: if anything uses this library at least once a year, the login is permanent. A daily cron entry like
 
     0 9 * * * /path/to/venv/bin/roku-smarthome status > /dev/null
 
@@ -174,7 +174,7 @@ The Roku Smart Home line is Wyze hardware sold under the Roku brand, but the dev
 
 ```
 src/roku_smarthome/
-    __init__.py       package entry, exports RokuSmartHome and Device
+    __init__.py       package entry, exports RokuSmartHome, Device and the exceptions
     client.py         the library: cookie handling, device list, commands
     cli.py            the command line
 pyproject.toml        packaging / build config

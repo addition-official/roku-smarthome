@@ -27,7 +27,7 @@ Confirmed on a real plug: several commands on one connection, a connection left 
 
 - Partial name matching: `on porch` works when only one device has "porch" in its name; ambiguous names list the matches. Also available in Python as `rk.find()`.
 - Hex colors: `rgb "Color bulb" "#ff8000"` (or `#f80`), alongside three numbers.
-- Distinct exit codes: 1 error, 2 bad arguments, 3 session expired, 4 Roku unavailable.
+- Distinct exit codes: 1 error, 2 bad arguments, 3 session expired, 4 Roku unavailable, 5 command failed, 130 interrupted.
 
 ### 5. Report errors Roku sends back for commands - done
 
