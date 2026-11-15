@@ -35,6 +35,25 @@ from websockets.protocol import State
 
 log = logging.getLogger(__name__)
 
+
+class _RedactCookies(logging.Filter):
+    """websockets logs every handshake header at DEBUG level, the Cookie
+    header included. Keep the session out of logs."""
+
+    def filter(self, record):
+        try:
+            msg = record.getMessage()
+        except Exception:
+            return True
+        if "ookie" in msg:
+            record.msg = re.sub(r"(?i)(cookie:\s*)\S.*", r"\1<redacted>", msg)
+            record.args = ()
+        return True
+
+
+_ws_log = logging.getLogger("roku_smarthome.websockets")
+_ws_log.addFilter(_RedactCookies())
+
 LEAVES_URL = "https://my.roku.com/smarthome/api/v1/leaves"
 SOCKET_URL = "wss://aspen-sockets.aspen.msc.roku.com/v1/socket"
 ORIGIN = "https://my.roku.com"
@@ -334,7 +353,15 @@ class RokuSmartHome:
         # live updates (on_change)
         self._listeners: List[Callable[["Device"], None]] = []
         self._listeners_lock = threading.Lock()
+        # serializes subscribe/unsubscribe/close so starting and stopping
+        # live updates can't interleave between threads
+        self._transition_lock = threading.Lock()
         self._listening = False             # touched on the event loop thread
+        self._live_error: Optional[Exception] = None
+        self._reconnect_delay = 1.0
+        self._seeding = False
+        self._seed_buffer: List[dict] = []
+        self._pid = os.getpid()
         self._live: Dict[str, dict] = {}    # leaf id -> raw device, kept current
         self._live_alias: Dict[str, str] = {}  # device.id -> leaf id
         self._reconnect_task: Optional[asyncio.Task] = None
@@ -581,7 +608,30 @@ class RokuSmartHome:
 
     # ----- websocket loop (one daemon thread, safe to call from anywhere) -----
 
+    def _check_fork(self):
+        """After os.fork() the child has this object but not the event loop
+        thread (or other threads holding locks). Start over cleanly there
+        instead of waiting on a loop nobody runs."""
+        if self._pid == os.getpid():
+            return
+        self._pid = os.getpid()
+        self._loop = None
+        self._loop_lock = threading.Lock()
+        self._cache_lock = threading.Lock()
+        self._listeners_lock = threading.Lock()
+        self._transition_lock = threading.Lock()
+        self._listeners = []
+        self._listening = False
+        self._live, self._live_alias = {}, {}
+        self._reconnect_task = None
+        self._events = None
+        self._ws = None
+        self._ws_lock = None
+        self._idle_handle = None
+        self._pending = {}
+
     def _get_loop(self) -> asyncio.AbstractEventLoop:
+        self._check_fork()
         with self._loop_lock:
             if self._loop is None or self._loop.is_closed():
                 loop = asyncio.new_event_loop()
@@ -616,13 +666,15 @@ class RokuSmartHome:
         confirm = self.confirm if confirm is None else bool(confirm)
         reply_wait = self.reply_timeout if confirm else 0.0
         if self.persistent:
-            # worst case: a send on a dead connection, then a fresh connect
+            # worst case: close a dead connection, open, a failed send, close,
+            # open again, then wait for the reply
             reply = self._run(self._ws_send_persistent(msg, confirm),
-                              timeout=2 * self.timeout + reply_wait + 2)
+                              timeout=4 * self.timeout + reply_wait + 2)
         else:
             w = self.command_wait if wait is None else float(wait)
+            # open, send and wait, then the close handshake
             reply = self._run(self._ws_send_once(msg, w, confirm),
-                              timeout=self.timeout + max(w, reply_wait) + 2)
+                              timeout=2 * self.timeout + max(w, reply_wait) + 2)
         # state may have changed on Roku's side; don't serve the stale list again
         self.invalidate()
         if reply is not None and reply.get("error"):
@@ -655,7 +707,7 @@ class RokuSmartHome:
         headers = {"Cookie": self._cookie_header(), "Origin": ORIGIN}
         try:
             ws = await ws_connect(self.socket_url, additional_headers=headers,
-                                  open_timeout=self.timeout)
+                                  open_timeout=self.timeout, logger=_ws_log)
         except websockets.exceptions.InvalidStatus as e:
             code = getattr(getattr(e, "response", None), "status_code", None)
             if code in (401, 403):
@@ -760,20 +812,35 @@ class RokuSmartHome:
         # Keep reading so the server's chatter can't fill the receive buffer
         # (a full buffer stops ping/pong processing and the connection dies),
         # and hand Roku's replies to the commands waiting for them.
+        loop = asyncio.get_running_loop()
+        started = loop.time()
         try:
             async for raw in ws:
-                self._dispatch(raw)
+                try:
+                    self._dispatch(raw)
+                except Exception:
+                    # one odd message must not stop the reader
+                    log.debug("roku-smarthome: ignored a message it couldn't handle",
+                              exc_info=True)
         except Exception:
             pass
-        if self._ws is ws:
+        try:  # make sure it's really closed, whatever ended the loop
+            await asyncio.wait_for(ws.close(), timeout=self.timeout)
+        except Exception:
+            pass
+        was_current = self._ws is ws  # not replaced or dropped on purpose
+        if was_current:
             self._ws = None
         for cid, (owner, fut) in list(self._pending.items()):
             if owner is ws and not fut.done():
                 fut.set_exception(RokuUnavailable(
                     "connection closed before Roku confirmed the command; "
                     "it may or may not have been applied"))
-        if self._listening and (self._reconnect_task is None or self._reconnect_task.done()):
-            self._reconnect_task = asyncio.get_running_loop().create_task(self._reconnect())
+        if loop.time() - started >= 60:
+            self._reconnect_delay = 1.0  # it was healthy; reconnect quickly
+        if (self._listening and was_current
+                and (self._reconnect_task is None or self._reconnect_task.done())):
+            self._reconnect_task = loop.create_task(self._reconnect())
 
     def _dispatch(self, raw):
         try:
@@ -785,7 +852,10 @@ class RokuSmartHome:
         if m.get("type") == "leaf_state_report":
             self._apply_state_report(m.get("payload"))
             return
-        entry = self._pending.get(m.get("id"))
+        cid = m.get("id")
+        if not isinstance(cid, str):
+            return
+        entry = self._pending.get(cid)
         if entry is not None and m.get("type") in ("send_command_resp", "send_command"):
             fut = entry[1]
             if not fut.done():
@@ -808,14 +878,22 @@ class RokuSmartHome:
             except Exception:
                 pass
 
-    async def _ws_close_locked(self):
+    async def _ws_close_locked(self, force: bool = False):
         async with self._lock():
+            if self._listening and not force:
+                return  # an idle close queued just before live updates started
             if self._idle_handle is not None:
                 self._idle_handle.cancel()
                 self._idle_handle = None
-            if self._ws is not None:
-                # Roku drops a command if the connection closes right after
-                # it, so give the last one time to be processed.
+            ws = self._ws
+            if ws is not None:
+                # Let commands still waiting for Roku's reply get it...
+                waiting = [f for owner, f in self._pending.values()
+                           if owner is ws and not f.done()]
+                if waiting:
+                    await asyncio.wait(waiting, timeout=self.reply_timeout)
+                # ...and Roku drops a command if the connection closes right
+                # after it, so give the last one time to be processed.
                 linger = self._last_send + self.command_wait - asyncio.get_running_loop().time()
                 if linger > 0:
                     await asyncio.sleep(linger)
@@ -836,57 +914,76 @@ class RokuSmartHome:
         commands or call devices(). Exceptions in a callback are logged and
         don't stop updates. Returns a function that removes the callback.
         """
-        with self._listeners_lock:
-            self._listeners.append(callback)
-            first = len(self._listeners) == 1
-        if first:
-            try:
-                self._run(self._start_listening(), timeout=2 * self.timeout + 5)
-            except BaseException:
-                self._remove_listener(callback)
-                raise
+        self._check_fork()
+        with self._transition_lock:
+            with self._listeners_lock:
+                self._listeners.append(callback)
+            if not self._listening:
+                try:
+                    self._run(self._start_listening(), timeout=3 * self.timeout + 5)
+                except BaseException:
+                    with self._listeners_lock:
+                        if callback in self._listeners:
+                            self._listeners.remove(callback)
+                    raise
 
         def unsubscribe():
             self._remove_listener(callback)
         return unsubscribe
 
     def _remove_listener(self, callback):
-        with self._listeners_lock:
-            if callback in self._listeners:
-                self._listeners.remove(callback)
-            last = not self._listeners
-        loop = self._loop
-        if last and loop is not None and loop.is_running():
-            try:
-                self._run(self._stop_listening(), timeout=self.timeout + 2)
-            except Exception:
-                pass
+        self._check_fork()
+        with self._transition_lock:
+            with self._listeners_lock:
+                if callback in self._listeners:
+                    self._listeners.remove(callback)
+                last = not self._listeners
+            loop = self._loop
+            if last and self._listening and loop is not None and loop.is_running():
+                try:
+                    self._run(self._stop_listening(), timeout=self.timeout + 2)
+                except Exception:
+                    pass
 
     @property
     def listening(self) -> bool:
         """True while live updates are on (some on_change callback is registered)."""
         return self._listening
 
+    @property
+    def live_error(self) -> Optional[Exception]:
+        """Why live updates are currently disconnected and retrying (e.g.
+        SessionExpired, RokuUnavailable), or None while connected. Retries
+        continue in the background; check this to notice a dead login."""
+        return self._live_error
+
     async def _start_listening(self):
         if self._listening:
             return
         self._listening = True
+        self._live_error = None
+        self._reconnect_delay = 1.0
         try:
-            await self._seed_live(fire=False)
+            # connect first, so changes during the device-list fetch are caught
             async with self._lock():
                 if self._ws is None or self._ws.state is not State.OPEN:
                     await self._ws_drop()
                     self._ws = await self._ws_open()
                     asyncio.get_running_loop().create_task(self._ws_reader(self._ws))
                 self._arm_idle_timer()  # cancels the idle timer while listening
+            await self._seed_live(fire=False)
         except BaseException:
             self._listening = False
+            self._live, self._live_alias = {}, {}
+            if self._ws is not None:
+                self._arm_idle_timer()
             raise
 
     async def _stop_listening(self):
         if not self._listening:
             return
         self._listening = False
+        self._live_error = None
         task, self._reconnect_task = self._reconnect_task, None
         if task is not None and task is not asyncio.current_task():
             task.cancel()
@@ -895,26 +992,74 @@ class RokuSmartHome:
             self._arm_idle_timer()
 
     async def _seed_live(self, fire: bool):
-        """Load full device details from the REST list. With fire, report every
-        device whose state differs from what we had (missed while offline)."""
+        """Load full device details from the REST list. Reports that arrive
+        while it's being fetched are applied on top, since the list may be
+        older than them. With fire, report every device whose visible state
+        differs from what we had (changes missed while offline); reports
+        received during the fetch are reported either way."""
         loop = asyncio.get_running_loop()
-        fresh = await loop.run_in_executor(None, self.raw_devices, 0)
-        live = {str(r["id"]): r for r in fresh
+        self._seed_buffer = []
+        self._seeding = True
+        try:
+            fresh = await loop.run_in_executor(None, self.raw_devices, 0)
+        finally:
+            self._seeding = False
+        buffered, self._seed_buffer = self._seed_buffer, []
+        live = {_text(r["id"]): r for r in fresh
                 if isinstance(r, dict) and r.get("id") is not None}
         alias = {}
         for leaf_id, r in live.items():
             hw = r.get("device")
             if isinstance(hw, dict) and hw.get("id") is not None:
-                alias[str(hw["id"])] = leaf_id
+                alias[_text(hw["id"])] = leaf_id
+        fetched = {k: self._visible(v) for k, v in live.items()}
+        touched = set()
+        for item in buffered:
+            leaf_id = self._merge_report(live, alias, item)
+            if leaf_id is not None:
+                touched.add(leaf_id)
         old, self._live, self._live_alias = self._live, live, alias
-        if fire:
-            for leaf_id, r in live.items():
-                if leaf_id not in old or old[leaf_id].get("state") != r.get("state"):
+        for leaf_id, r in live.items():
+            now = self._visible(r)
+            if fire:
+                if now != self._visible(old.get(leaf_id)):
                     self._fire(r)
+            elif leaf_id in touched and now != fetched[leaf_id]:
+                self._fire(r)
+
+    def _visible(self, raw: Optional[dict]):
+        """The state a callback cares about, ignoring Roku's bookkeeping
+        fields (updated, eventId) that change on every report."""
+        if raw is None:
+            return None
+        try:
+            d = Device(self, raw)
+        except Exception:
+            return None
+        rgb = tuple(d.color_rgb) if isinstance(d.color_rgb, list) else d.color_rgb
+        return (d.name, d.power, d.online, d.brightness, d.color_temp, d.color_type, rgb)
+
+    @staticmethod
+    def _merge_report(live: dict, alias: dict, item) -> Optional[str]:
+        """Apply one report item to `live`; returns the leaf id it changed."""
+        if not isinstance(item, dict) or not isinstance(item.get("state"), dict):
+            return None
+        rid = _text(item.get("id"))
+        leaf_id = rid if rid in live else alias.get(rid)
+        if leaf_id is None:
+            return None
+        raw = live[leaf_id]
+        state = raw.get("state") if isinstance(raw.get("state"), dict) else {}
+        raw["state"] = {**state, **item["state"]}
+        return leaf_id
 
     async def _reconnect(self):
-        delay = 1.0
+        # The delay doubles on every attempt, up to 60 s, and only resets once
+        # a connection has stayed up for a minute: a server that accepts the
+        # connection and then drops it right away can't cause a fast loop.
         while self._listening:
+            delay = self._reconnect_delay
+            self._reconnect_delay = min(delay * 2, 60.0)
             await asyncio.sleep(delay)
             if not self._listening:
                 return
@@ -925,13 +1070,18 @@ class RokuSmartHome:
                         self._ws = await self._ws_open()
                         asyncio.get_running_loop().create_task(self._ws_reader(self._ws))
                 await self._seed_live(fire=True)
-                return
             except asyncio.CancelledError:
                 raise
             except Exception as e:
-                log.warning("roku-smarthome: live updates reconnect failed (%s); "
-                            "retrying in %.0f s", e, min(delay * 2, 60))
-                delay = min(delay * 2, 60.0)
+                self._live_error = e
+                level = logging.ERROR if isinstance(e, SessionExpired) else logging.WARNING
+                log.log(level, "roku-smarthome: live updates reconnect failed (%s); "
+                        "retrying in %.0f s", e, self._reconnect_delay)
+                continue
+            if self._ws is not None and self._ws.state is State.OPEN:
+                self._live_error = None
+                return
+            # the new connection dropped while the device list was loading
 
     def _apply_state_report(self, payload):
         # {"type": "leaf_state_report", "payload": [{"id": ..., "type": "device",
@@ -940,16 +1090,16 @@ class RokuSmartHome:
         if not self._listening or not isinstance(payload, list):
             return
         for item in payload:
-            if not isinstance(item, dict) or not isinstance(item.get("state"), dict):
-                continue
-            rid = str(item.get("id"))
+            if self._seeding:
+                self._seed_buffer.append(copy.deepcopy(item))
+            rid = _text(item.get("id")) if isinstance(item, dict) else ""
             leaf_id = rid if rid in self._live else self._live_alias.get(rid)
-            if leaf_id is None:
+            before = self._visible(self._live.get(leaf_id)) if leaf_id else None
+            if self._merge_report(self._live, self._live_alias, item) is None:
                 continue
             raw = self._live[leaf_id]
-            state = raw.get("state") if isinstance(raw.get("state"), dict) else {}
-            raw["state"] = {**state, **item["state"]}
-            self._fire(raw)
+            if self._visible(raw) != before:
+                self._fire(raw)
 
     def _fire(self, raw: dict):
         if not self._listeners:
@@ -978,19 +1128,23 @@ class RokuSmartHome:
     def close(self):
         """Stop live updates and close the shared websocket, flushing anything
         still being sent. Safe to call more than once; the next command reopens it."""
-        with self._listeners_lock:
-            self._listeners.clear()
-        loop = self._loop
-        if loop is None or loop.is_closed() or not loop.is_running():
-            return
-        try:
-            self._run(self._stop_listening(), timeout=self.timeout + 2)
-        except Exception:
-            pass
-        try:
-            self._run(self._ws_close_locked(), timeout=self.timeout + self.command_wait + 2)
-        except Exception:
-            pass
+        if self._pid != os.getpid():
+            return  # a forked child: the parent's connection isn't ours to close
+        with self._transition_lock:
+            with self._listeners_lock:
+                self._listeners.clear()
+            loop = self._loop
+            if loop is None or loop.is_closed() or not loop.is_running():
+                return
+            try:
+                self._run(self._stop_listening(), timeout=self.timeout + 2)
+            except Exception:
+                pass
+            try:
+                self._run(self._ws_close_locked(force=True),
+                          timeout=self.reply_timeout + self.command_wait + self.timeout + 2)
+            except Exception:
+                pass
 
     def __enter__(self) -> "RokuSmartHome":
         return self
