@@ -16,6 +16,8 @@ import copy
 import json
 import logging
 import operator
+import re
+import tempfile
 import os
 import threading
 import time
@@ -73,11 +75,25 @@ def _whole_number(value, what: str) -> int:
         raise ValueError(f"{what} must be a whole number, got {value!r}") from None
 
 
+_CURL_COOKIE_HEADER = re.compile(
+    r"""(?:-H|--header)\s+\$?(['"])\s*cookie:\s*(.*?)\1""", re.IGNORECASE | re.DOTALL)
+_CURL_COOKIE_FLAG = re.compile(
+    r"""(?:^|\s)(?:-b|--cookie)\s+\$?(['"])(.*?)\1""", re.DOTALL)
+
+
 def _clean_cookie_header(header: str) -> str:
     """Strip what tends to come along when the header is copied from DevTools
     or a "Copy as cURL" line: -H/-b flags, quotes, a 'Cookie:' prefix and the
-    trailing line-continuation backslash."""
-    h = header.strip().rstrip("\\").strip()
+    trailing line-continuation backslash. From a whole cURL command, only the
+    cookie header is kept. Handles bash ($'...') and Windows cmd (^"...^")
+    quoting."""
+    h = header.strip()
+    if '^"' in h:  # "Copy as cURL (cmd)": ^ escapes every special character
+        h = re.sub(r"\^(.)", r"\1", h)
+    m = _CURL_COOKIE_HEADER.search(h) or _CURL_COOKIE_FLAG.search(h)
+    if m:
+        return m.group(2).strip()
+    h = h.rstrip("\\").strip()
     for flag in ("--header", "--cookie", "-H", "-b"):
         if h.startswith(flag + " "):
             h = h[len(flag):].strip()
@@ -89,10 +105,19 @@ def _clean_cookie_header(header: str) -> str:
     return h
 
 
+# what a browser can put in a Cookie header: printable ASCII only
+_COOKIE_TEXT = re.compile(r"^[\x20-\x7e]*$")
+
+
 def parse_cookie_header(header: str) -> Dict[str, str]:
     """Parse a Cookie header by hand: SimpleCookie silently returns nothing if
     the header contains a bare token without '=' (browsers emit these, e.g.
-    'roku_test;')."""
+    'roku_test;'). If a name appears twice, the first one wins, as browsers
+    list the most specific cookie first.
+
+    Raises ValueError (without echoing the cookie) for characters a browser
+    never sends, such as line breaks or smart quotes from a chat or document;
+    they would break every request or leak the cookie into error messages."""
     cookies: Dict[str, str] = {}
     for part in _clean_cookie_header(header).split(";"):
         part = part.strip()
@@ -100,9 +125,22 @@ def parse_cookie_header(header: str) -> Dict[str, str]:
             continue
         k, v = part.split("=", 1)
         k, v = k.strip(), v.strip()
-        if k:
-            cookies[k] = v
+        if not k:
+            continue
+        if not (_COOKIE_TEXT.match(k) and _COOKIE_TEXT.match(v)):
+            raise ValueError(
+                f"the pasted cookie {k!r} contains characters a browser wouldn't "
+                "send (a line break, or a curly quote from a chat or document). "
+                "Copy the Cookie header straight from the browser's DevTools.")
+        cookies.setdefault(k, v)
     return cookies
+
+
+def _text(value) -> str:
+    """Roku's JSON may carry a number or null where a string is expected."""
+    if value is None:
+        return ""
+    return value if isinstance(value, str) else str(value)
 
 
 class SessionExpired(Exception):
@@ -146,13 +184,13 @@ class Device:
             return v if isinstance(v, dict) else {}
 
         self.raw = raw
-        self.id: str = str(raw["id"])
-        self.name: str = raw.get("name") or ""
+        self.id: str = _text(raw["id"])
+        self.name: str = _text(raw.get("name"))
         hw = obj(raw, "device")
-        self.type: str = raw.get("subType") or hw.get("type") or ""
-        self._leaf_type: str = raw.get("type") or "device"
-        self.model: str = hw.get("model") or ""
-        self.local_ip: str = hw.get("localIp") or ""
+        self.type: str = _text(raw.get("subType") or hw.get("type"))
+        self._leaf_type: str = _text(raw.get("type")) or "device"
+        self.model: str = _text(hw.get("model"))
+        self.local_ip: str = _text(hw.get("localIp"))
         commands = raw.get("supportedCommands")
         self.supported_commands = {
             c.get("type") for c in (commands if isinstance(commands, list) else [])
@@ -310,6 +348,7 @@ class RokuSmartHome:
 
     def _load_session(self):
         self._cookie_error: Optional[str] = None
+        self._cookies_dirty = False  # in memory, not yet saved (a save failed)
         self._use_cookies(self._read_cookie_file())
 
     def _use_cookies(self, cookies: Dict[str, str]):
@@ -345,19 +384,25 @@ class RokuSmartHome:
         return data
 
     def _write_cookie_file(self):
-        # Write a private temp file and swap it in: the file is never readable
-        # by other users, and a crash mid-write can't leave it half-written.
+        # Write a new private temp file and swap it in. mkstemp creates a file
+        # with a unique random name, mode 0600, and refuses to follow an
+        # existing file or symlink, so another user can't pre-plant it, two
+        # processes saving at once can't write into each other's temp file,
+        # and a crash mid-write can't leave the real file half-written.
         path = self.cookie_file
         path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_name(path.name + ".tmp")
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w") as f:
-            f.write(json.dumps(self._cookies, indent=2))
+        fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=path.name + ".", suffix=".tmp")
         try:
-            os.chmod(tmp, 0o600)  # in case a stale temp file had other permissions
-        except OSError:
-            pass
-        os.replace(tmp, path)
+            with os.fdopen(fd, "w") as f:
+                f.write(json.dumps(self._cookies, indent=2))
+            os.replace(tmp, path)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+        self._cookies_dirty = False
 
     def import_cookie_header(self, header: str, verify: bool = False) -> int:
         """Store a `Cookie:` header value copied from the browser (a "Copy as cURL"
@@ -371,32 +416,57 @@ class RokuSmartHome:
             raise ValueError(
                 "no ks.session cookie found. Copy the whole Cookie header from the "
                 "'leaves' request on my.roku.com/smarthome")
+        if not cookies["ks.session"]:
+            raise ValueError("the ks.session cookie is empty; copy the Cookie header again")
         old_cookies, old_error = self._cookies, self._cookie_error
         self._cookie_error = None
         self._use_cookies(cookies)
         self.invalidate()
-        if verify:
-            try:
-                self.raw_devices(max_age=0)
-            except BaseException:
-                self._cookie_error = old_error
-                self._use_cookies(old_cookies)
-                self.invalidate()
-                raise
-        self._write_cookie_file()
+        try:
+            if verify:
+                self._verifying = True  # don't save renewed cookies until verified
+                try:
+                    self.raw_devices(max_age=0)
+                finally:
+                    self._verifying = False
+            self._write_cookie_file()
+        except BaseException:
+            # keep the previous login, in memory and on disk
+            self._cookie_error = old_error
+            self._use_cookies(old_cookies)
+            self.invalidate()
+            raise
         return len(self._cookies)
 
     def _persist_refreshed_cookies(self):
-        changed = False
+        """Save cookies Roku renewed (or deleted) in this response. A failed
+        save is logged, not raised: the request itself worked, and the save is
+        retried on the next request."""
+        changed = self._cookies_dirty
+        in_jar = set()
         for c in self._session.cookies:
             if c.name in _SKIP:
                 continue
+            in_jar.add(c.name)
             if self._cookies.get(c.name) != c.value:
                 self._cookies[c.name] = c.value
                 changed = True
+        # A cookie we set in the jar is only missing if Roku deleted it
+        # (e.g. Max-Age=0 on logout); don't put the dead value back.
+        for name in [k for k in self._cookies if k not in _SKIP and k not in in_jar]:
+            del self._cookies[name]
+            changed = True
         self._sync_jar()
         if changed:
-            self._write_cookie_file()
+            if getattr(self, "_verifying", False):
+                self._cookies_dirty = True  # import_cookie_header saves after verifying
+                return
+            try:
+                self._write_cookie_file()
+            except OSError as e:
+                self._cookies_dirty = True
+                log.warning("roku-smarthome: could not save renewed login to %s (%s); "
+                            "will retry", self.cookie_file, e.strerror or e)
 
     def _cookie_header(self) -> str:
         return "; ".join(f"{k}={v}" for k, v in self._cookies.items() if k not in _SKIP)
@@ -426,6 +496,12 @@ class RokuSmartHome:
             )
         except requests.RequestException as e:
             raise RokuUnavailable(f"could not reach Roku: {e}") from e
+        except (ValueError, UnicodeError) as e:
+            # a header http.client refuses; its message would include the
+            # cookie, so don't repeat it
+            raise SessionExpired(
+                "the saved cookie can't be sent (it contains invalid characters). "
+                "Run: roku-smarthome login") from None
 
         code = r.status_code
         # a redirect means "go log in"
@@ -437,7 +513,6 @@ class RokuSmartHome:
             raise RokuUnavailable("Roku is rate limiting requests (HTTP 429); slow down and retry")
         if code >= 400:
             raise RokuUnavailable(f"Roku returned HTTP {code}")
-        self._persist_refreshed_cookies()
         try:
             data = r.json()
         except ValueError as e:
@@ -445,6 +520,9 @@ class RokuSmartHome:
         if not isinstance(data, list):
             raise RokuUnavailable(
                 f"Roku returned an unexpected device list ({type(data).__name__}, not a list)")
+        # only now: a response that isn't a real device list (e.g. an error
+        # page) must not get its cookies saved
+        self._persist_refreshed_cookies()
         return data
 
     def raw_devices(self, max_age: Optional[float] = None) -> List[dict]:
@@ -467,26 +545,32 @@ class RokuSmartHome:
             max_age: Optional[float] = None) -> Device:
         """Exact lookup by name (any case) or, with by_id=True, by id. Raises
         DeviceNotFound if nothing matches, or if several devices share the name."""
-        key = name_or_id.lower()
+        wanted = _text(name_or_id).strip()
+        key = wanted.lower()
         matches = [d for d in self.devices(max_age)
-                   if (d.id == name_or_id if by_id else d.name.lower() == key)]
+                   if (d.id == wanted if by_id else d.name.strip().lower() == key)]
         if len(matches) == 1:
             return matches[0]
+        if matches and by_id:
+            raise DeviceNotFound(f"several devices have the id {wanted!r}")
         if matches:
             ids = ", ".join(d.id for d in matches)
             raise DeviceNotFound(
-                f"several devices are named {name_or_id!r} (ids: {ids}); use get(id, by_id=True)")
-        raise DeviceNotFound(name_or_id)
+                f"several devices are named {wanted!r} (ids: {ids}); use get(id, by_id=True)")
+        raise DeviceNotFound(wanted)
 
     def find(self, query: str, max_age: Optional[float] = None) -> Device:
         """Forgiving lookup for people typing names: an exact name (any case),
         then a device id, then any device whose name contains `query`, as long
         as only one does. Raises DeviceNotFound listing the candidates."""
         devices = self.devices(max_age)
-        q = query.strip().lower()
-        for match in ([d for d in devices if d.name.lower() == q],
+        query = _text(query).strip()
+        if not query:
+            raise DeviceNotFound("no device name given")
+        q = query.lower()
+        for match in ([d for d in devices if d.name.strip().lower() == q],
                       [d for d in devices if d.id == query],
-                      [d for d in devices if q and q in d.name.lower()]):
+                      [d for d in devices if q in d.name.lower()]):
             if len(match) == 1:
                 return match[0]
             if len(match) > 1:
@@ -577,7 +661,7 @@ class RokuSmartHome:
             if code in (401, 403):
                 raise SessionExpired(
                     f"Roku rejected the session on the websocket (HTTP {code}). "
-                    "Run: roku-smarthome login '<cookie>'"
+                    "Run: roku-smarthome login"
                 ) from e
             raise RokuUnavailable(f"websocket handshake failed (HTTP {code})") from e
         except (OSError, asyncio.TimeoutError, websockets.exceptions.WebSocketException) as e:
