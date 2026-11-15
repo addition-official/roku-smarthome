@@ -177,8 +177,9 @@ def _main(argv=None):
                 except (BrokenPipeError, OSError):
                     output_closed.set()  # e.g. `watch | head -3` is done
 
-            rk.on_change(show)
+            # header first, so it can't land after the first change
             print("Watching for changes (Ctrl-C to stop)...", flush=True)
+            rk.on_change(show)
             end = None if args.seconds is None else time.monotonic() + args.seconds
             try:
                 while not output_closed.wait(1.0):

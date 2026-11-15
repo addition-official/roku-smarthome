@@ -20,7 +20,7 @@ Fixes from a multi-agent security, edge-case and bug review. Every fix has a reg
 - Roku deleting the session cookie (logout) was undone.
 - Pasted cookies with line breaks or curly quotes broke every request and could print the cookie in error messages; they're now rejected. Whole "Copy as cURL" commands (bash, `$'...'` and Windows cmd quoting) now work.
 - Lookups: numeric ids, names with surrounding spaces, `find("")`, and non-text names from Roku.
-- CLI: `watch | head` never exited; `status | head` and Ctrl-C printed tracebacks; `login` with closed input crashed; a terminal that can't show emoji turned a successful command into an error; device names could send escape sequences to the terminal; `watch --seconds` accepted invalid values.
+- CLI: `watch | head` never exited; `status | head` and Ctrl-C printed tracebacks; `login` with closed input crashed; a terminal that can't show emoji turned a successful command into an error; device names could send escape sequences to the terminal; `watch --seconds` accepted invalid values; a change could print above `watch`'s header.
 - The source package's tests couldn't run (missing `conftest.py`).
 
 ### Added
