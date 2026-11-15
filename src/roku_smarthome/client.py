@@ -545,12 +545,23 @@ class RokuSmartHome:
             reason = self._cookie_error or f"No session saved at {self.cookie_file}."
             raise SessionExpired(f"{reason} Run: roku-smarthome login")
         try:
-            r = self._session.get(
-                LEAVES_URL,
-                headers={"x-request-id": str(uuid.uuid4())},
-                allow_redirects=False,
-                timeout=self.timeout,
-            )
+            for attempt in (1, 2):
+                try:
+                    r = self._session.get(
+                        LEAVES_URL,
+                        headers={"x-request-id": str(uuid.uuid4())},
+                        allow_redirects=False,
+                        timeout=self.timeout,
+                    )
+                    break
+                except requests.ConnectionError as e:
+                    # After a long idle, the reused keep-alive connection may
+                    # already be closed by Roku ("Remote end closed connection
+                    # without response"). One retry gets a fresh connection.
+                    # Timeouts aren't retried: that would only double the wait.
+                    if attempt == 2 or isinstance(e, requests.Timeout):
+                        raise
+                    log.debug("roku-smarthome: retrying device list on a fresh connection (%s)", e)
         except requests.RequestException as e:
             raise RokuUnavailable(f"could not reach Roku: {e}") from e
         except (ValueError, UnicodeError) as e:

@@ -133,3 +133,45 @@ def test_returned_device_list_is_a_copy(rk, monkeypatch):
     first.append({"id": "b"})
     again = rk.raw_devices()
     assert again == [{"id": "a", "name": "Lamp", "state": {}}]
+
+
+def test_stale_keepalive_connection_is_retried_once(rk, monkeypatch):
+    # Seen on real hardware after a long idle: the first request on a reused
+    # connection fails with RemoteDisconnected; a fresh connection works.
+    from http.client import RemoteDisconnected
+    calls = {"n": 0}
+
+    def flaky_get(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise requests.ConnectionError(
+                ("Connection aborted.",
+                 RemoteDisconnected("Remote end closed connection without response")))
+        return FakeResponse(200, [{"id": "a", "name": "Lamp"}])
+    monkeypatch.setattr(rk._session, "get", flaky_get)
+    assert [d.name for d in rk.devices()] == ["Lamp"]
+    assert calls["n"] == 2
+
+
+def test_connection_error_twice_is_unavailable(rk, monkeypatch):
+    calls = {"n": 0}
+
+    def down(*args, **kwargs):
+        calls["n"] += 1
+        raise requests.ConnectionError("down")
+    monkeypatch.setattr(rk._session, "get", down)
+    with pytest.raises(RokuUnavailable):
+        rk.raw_devices()
+    assert calls["n"] == 2
+
+
+def test_timeout_is_not_retried(rk, monkeypatch):
+    calls = {"n": 0}
+
+    def slow(*args, **kwargs):
+        calls["n"] += 1
+        raise requests.ConnectTimeout("timed out")
+    monkeypatch.setattr(rk._session, "get", slow)
+    with pytest.raises(RokuUnavailable):
+        rk.raw_devices()
+    assert calls["n"] == 1

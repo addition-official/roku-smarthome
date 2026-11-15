@@ -11,6 +11,7 @@ Nothing yet.
 Fixes from a multi-agent security, edge-case and bug review. Every fix has a regression test that failed before it.
 
 ### Fixed
+- After a long idle, the first device-list request could fail with "Remote end closed connection without response", because Roku had closed the reused connection (seen on real hardware during a live-updates reconnect). It's now retried once on a fresh connection.
 - Live updates could stop for good, without any message, if the connection dropped again while a reconnect was loading the device list.
 - Subscribing and unsubscribing on two threads at once could leave a callback registered but never called.
 - A server that accepted and then dropped the connection caused a reconnect and a full device-list fetch every ~2 seconds forever. Reconnects now back off to 60 s.
