@@ -4,6 +4,10 @@ What changed in each release on [PyPI](https://pypi.org/project/roku-smarthome/)
 
 ## Unreleased
 
+Nothing yet.
+
+## 0.3.2
+
 Fixes from a multi-agent security, edge-case and bug review. Every fix has a regression test that failed before it.
 
 ### Fixed
