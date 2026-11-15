@@ -23,6 +23,7 @@ import threading
 import time
 import uuid
 import weakref
+from urllib.parse import urlsplit
 from pathlib import Path
 from typing import Callable, Dict, List, Optional
 import concurrent.futures
@@ -153,6 +154,35 @@ def parse_cookie_header(header: str) -> Dict[str, str]:
                 "Copy the Cookie header straight from the browser's DevTools.")
         cookies.setdefault(k, v)
     return cookies
+
+
+def _socket_url_allowed(url: str) -> bool:
+    """The session cookie is only ever sent to Roku over TLS, or to this
+    machine (for testing against a local fake server)."""
+    try:
+        u = urlsplit(url)
+        host = (u.hostname or "").lower()
+    except ValueError:
+        return False
+    if u.scheme == "wss" and (host == "roku.com" or host.endswith(".roku.com")):
+        return True
+    return u.scheme in ("ws", "wss") and host in ("localhost", "127.0.0.1", "::1")
+
+
+# Windows: another program (antivirus, search indexer, an editor) briefly
+# holding the cookie file open makes os.replace fail with PermissionError.
+_RETRY_REPLACE = os.name == "nt"
+
+
+def _replace(src, dst):
+    for attempt in range(5):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError:
+            if not _RETRY_REPLACE or attempt == 4:
+                raise
+            time.sleep(0.05 * (attempt + 1))
 
 
 def _text(value) -> str:
@@ -422,7 +452,7 @@ class RokuSmartHome:
         try:
             with os.fdopen(fd, "w") as f:
                 f.write(json.dumps(self._cookies, indent=2))
-            os.replace(tmp, path)
+            _replace(tmp, path)
         except BaseException:
             try:
                 os.unlink(tmp)
@@ -704,6 +734,10 @@ class RokuSmartHome:
     # ----- websocket plumbing (runs on the event loop thread) -----
 
     async def _ws_open(self):
+        if not _socket_url_allowed(self.socket_url):
+            raise ValueError(
+                f"refusing to send the Roku session to {self.socket_url!r}: "
+                "socket_url must be a wss:// address on roku.com (or localhost)")
         headers = {"Cookie": self._cookie_header(), "Origin": ORIGIN}
         try:
             ws = await ws_connect(self.socket_url, additional_headers=headers,
@@ -913,11 +947,14 @@ class RokuSmartHome:
         Callbacks run one at a time on a separate thread, so they may send
         commands or call devices(). Exceptions in a callback are logged and
         don't stop updates. Returns a function that removes the callback.
+        Registering the same callback again does nothing (it is still called
+        once per change).
         """
         self._check_fork()
         with self._transition_lock:
             with self._listeners_lock:
-                self._listeners.append(callback)
+                if callback not in self._listeners:  # registering twice is a no-op
+                    self._listeners.append(callback)
             if not self._listening:
                 try:
                     self._run(self._start_listening(), timeout=3 * self.timeout + 5)

@@ -242,3 +242,17 @@ def test_cli_watch_exits_3_when_login_expires(rk, server, monkeypatch, capsys):
     with pytest.raises(SystemExit) as exc:
         cli.main(["watch", "--seconds", "20"])
     assert exc.value.code == cli.EXIT_SESSION_EXPIRED
+
+
+def test_registering_same_callback_twice_calls_it_once(rk, server):
+    changes = Changes()
+    stop1 = rk.on_change(changes)
+    stop2 = rk.on_change(changes)
+    server.wait_for_clients()
+    server.push(report("leaf-2", power="on"))
+    changes.wait(1)
+    time.sleep(0.3)
+    assert len(changes.devices) == 1
+    stop2()
+    assert not rk.listening  # the one registration is gone
+    stop1()                  # harmless

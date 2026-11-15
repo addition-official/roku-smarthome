@@ -24,10 +24,13 @@ Fixes from a multi-agent security, edge-case and bug review. Every fix has a reg
 - The source package's tests couldn't run (missing `conftest.py`).
 
 ### Added
+- The session cookie is only ever sent to Roku over TLS (`wss://` on roku.com) or to localhost; any other `socket_url` is refused.
 - `rk.live_error`: why live updates are retrying (e.g. `SessionExpired`), or `None` while connected. `watch` exits with code 3 when the login expires.
 - CLI exit code 130 for Ctrl-C.
 
 ### Changed
+- Registering the same `on_change` callback twice no longer calls it twice per change.
+- On Windows, saving the cookie file retries briefly if another program has it open.
 - Callbacks fire only when a device's visible state changes, not for reports that only update Roku's internal timestamps.
 - The `login` prompt doesn't show the pasted cookie. Hints no longer suggest putting the cookie on the command line.
 - The `websockets` library's debug logs no longer include the session cookie.

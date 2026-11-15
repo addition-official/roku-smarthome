@@ -226,3 +226,64 @@ def test_duplicate_ids_message_says_id(client):
     with pytest.raises(DeviceNotFound) as exc:
         client.get("x", by_id=True)
     assert "id" in str(exc.value) and "named" not in str(exc.value)
+
+
+# ----- the three low-risk items -----
+
+@pytest.mark.parametrize("url,ok", [
+    ("wss://aspen-sockets.aspen.msc.roku.com/v1/socket", True),
+    ("wss://roku.com/x", True),
+    ("ws://127.0.0.1:1234", True),
+    ("ws://localhost:1234", True),
+    ("ws://aspen-sockets.aspen.msc.roku.com/v1/socket", False),  # no TLS
+    ("wss://evil.example.com/socket", False),
+    ("wss://roku.com.evil.example/socket", False),
+    ("wss://notroku.com/socket", False),
+    ("https://my.roku.com/", False),
+    ("not a url", False),
+])
+def test_socket_url_allow_list(url, ok):
+    from roku_smarthome.client import _socket_url_allowed
+    assert _socket_url_allowed(url) is ok
+
+
+def test_cookie_never_sent_to_other_hosts(cookie_file):
+    rk = RokuSmartHome(cookie_file, timeout=2)
+    rk.import_cookie_header("ks.session=SECRET")
+    rk.socket_url = "wss://evil.example.com/socket"
+    from roku_smarthome import Device
+    with pytest.raises(ValueError) as exc:
+        Device(rk, make_leaf()).turn_on()
+    assert "SECRET" not in str(exc.value)
+    rk.close()
+
+
+def test_replace_retries_briefly_on_windows_style_lock(tmp_path, monkeypatch):
+    import roku_smarthome.client as c
+    monkeypatch.setattr(c, "_RETRY_REPLACE", True)
+    real = os.replace
+    fails = {"n": 2}
+
+    def locked_then_free(src, dst):
+        if fails["n"]:
+            fails["n"] -= 1
+            raise PermissionError(13, "file in use")
+        real(src, dst)
+    monkeypatch.setattr(c.os, "replace", locked_then_free)
+    rk = RokuSmartHome(tmp_path / "c.json")
+    rk.import_cookie_header("ks.session=x")
+    assert json.loads((tmp_path / "c.json").read_text()) == {"ks.session": "x"}
+
+
+def test_replace_does_not_retry_real_permission_errors_on_posix(tmp_path, monkeypatch):
+    import roku_smarthome.client as c
+    monkeypatch.setattr(c, "_RETRY_REPLACE", False)
+    calls = {"n": 0}
+
+    def denied(src, dst):
+        calls["n"] += 1
+        raise PermissionError(13, "denied")
+    monkeypatch.setattr(c.os, "replace", denied)
+    with pytest.raises(PermissionError):
+        RokuSmartHome(tmp_path / "c.json").import_cookie_header("ks.session=x")
+    assert calls["n"] == 1
