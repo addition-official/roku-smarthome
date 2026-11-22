@@ -55,7 +55,7 @@ def positive_seconds(value):
     return f
 
 
-def describe(d):
+def describe(d, depth=0):
     extra = ""
     if d.brightness is not None:
         extra += f" {d.brightness}%"
@@ -63,7 +63,8 @@ def describe(d):
         extra += f" {d.color_temp}K"
     if d.color_rgb:
         extra += f" rgb{tuple(d.color_rgb)}"
-    return (f"{printable(d.name):32} {printable(d.type):8} {(d.power or '?').upper():4} "
+    name = "  " * depth + printable(d.name)  # a group's devices indented under it
+    return (f"{name:32} {printable(d.type):8} {(d.power or '?').upper():4} "
             f"({'online' if d.online else 'OFFLINE'}){extra}")
 
 
@@ -162,8 +163,10 @@ def _main(argv=None):
             return
 
         if args.cmd == "status":
-            for d in rk.devices():
-                print(describe(d))
+            depth = {}
+            for d in rk.devices(include_members=True):  # a group's devices under it
+                depth[d.id] = depth[d.group_id] + 1 if d.group_id else 0
+                print(describe(d, depth[d.id]))
             return
 
         if args.cmd == "watch":

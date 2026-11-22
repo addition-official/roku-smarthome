@@ -156,6 +156,39 @@ def parse_cookie_header(header: str) -> Dict[str, str]:
     return cookies
 
 
+def _leaves(items) -> List[dict]:
+    """The usable entries of a leaf list from Roku (dicts with an id)."""
+    return [r for r in (items if isinstance(items, list) else [])
+            if isinstance(r, dict) and r.get("id") is not None]
+
+
+def _flatten_leaves(leaves) -> List[tuple]:
+    """Roku's device list with each group's members right after the group, as
+    (raw, group_id) pairs. A room group comes back from Roku as one leaf of type
+    "group" with its devices nested in "memberLeaves"; they are real devices
+    with their own ids, state and commands. Roku's app puts each device in one
+    room, so a device normally appears once. If one ever appears again (also at
+    the top level, or in a second group), it is listed only where it first
+    appears, top-level entries first, so nothing is lost or listed twice."""
+    top = _leaves(leaves)
+    seen = {_text(r["id"]) for r in top}
+    out: List[tuple] = []
+
+    def add_members(group):
+        if group.get("type") != "group":
+            return
+        for m in _leaves(group.get("memberLeaves")):
+            if _text(m["id"]) not in seen:
+                seen.add(_text(m["id"]))
+                out.append((m, _text(group["id"])))
+                add_members(m)
+
+    for raw in top:
+        out.append((raw, None))
+        add_members(raw)
+    return out
+
+
 def _socket_url_allowed(url: str) -> bool:
     """The session cookie is only ever sent to Roku over TLS, or to this
     machine (for testing against a local fake server)."""
@@ -222,8 +255,11 @@ class CommandFailed(Exception):
 class Device:
     """One Roku Smart Home device ("leaf" in Roku's API)."""
 
-    def __init__(self, client: "RokuSmartHome", raw: dict):
+    def __init__(self, client: "RokuSmartHome", raw: dict,
+                 group_id: Optional[str] = None):
         self._client = client
+        #: id of the group this device is a member of, or None
+        self.group_id: Optional[str] = group_id
         self._load(raw)
 
     def _load(self, raw: dict):
@@ -236,8 +272,9 @@ class Device:
         self.id: str = _text(raw["id"])
         self.name: str = _text(raw.get("name"))
         hw = obj(raw, "device")
-        self.type: str = _text(raw.get("subType") or hw.get("type"))
         self._leaf_type: str = _text(raw.get("type")) or "device"
+        self.type: str = _text(raw.get("subType") or hw.get("type")) or (
+            "group" if self._leaf_type == "group" else "")
         self.model: str = _text(hw.get("model"))
         self.local_ip: str = _text(hw.get("localIp"))
         commands = raw.get("supportedCommands")
@@ -253,12 +290,29 @@ class Device:
         self.color_temp: Optional[int] = color.get("temperature")
         self.color_type: Optional[str] = color.get("colorType")
         self.color_rgb: Optional[list] = color.get("rgb")
+        self._members: Optional[List["Device"]] = None
+
+    @property
+    def members(self) -> List["Device"]:
+        """For a group, the devices in it (each with group_id set), as of when
+        the group was fetched; otherwise empty."""
+        if self._members is None:
+            nested = self.raw.get("memberLeaves") if self.is_group else None
+            self._members = [Device(self._client, m, group_id=self.id) for m in _leaves(nested)]
+        return self._members
+
+    @property
+    def is_group(self) -> bool:
+        """A Roku room group. It takes the same commands as a device (they go
+        to every member) and reports its members' combined state."""
+        return self._leaf_type == "group"
 
     # ----- state -----
 
     def refresh(self) -> "Device":
         """Re-fetch this device's state from Roku, bypassing the cache."""
         fresh = self._client.get(self.id, by_id=True, max_age=0)
+        self.group_id = fresh.group_id
         self._load(fresh.raw)
         return self
 
@@ -605,9 +659,22 @@ class RokuSmartHome:
             # a deep copy, so callers editing the result can't change the cache
             return copy.deepcopy(self._cache_raw)
 
-    def devices(self, max_age: Optional[float] = None) -> List[Device]:
-        return [Device(self, raw) for raw in self.raw_devices(max_age)
-                if isinstance(raw, dict) and raw.get("id") is not None]
+    def devices(self, max_age: Optional[float] = None,
+                include_members: bool = False) -> List[Device]:
+        """The devices on the account as Roku lists them: a room group is one
+        entry, with its devices in `group.members`. With include_members=True,
+        each group is followed by the devices in it (each with `group_id` set)."""
+        raw = self.raw_devices(max_age)
+        if not include_members:
+            return [Device(self, r) for r in _leaves(raw)]
+        return [Device(self, r, group_id=g) for r, g in _flatten_leaves(raw)]
+
+    def _lookup_pools(self, max_age: Optional[float]) -> List[List[Device]]:
+        """Where get() and find() look, in order: the top-level entries, then
+        the devices in groups."""
+        devices = self.devices(max_age, include_members=True)
+        return [[d for d in devices if d.group_id is None],
+                [d for d in devices if d.group_id is not None]]
 
     def get(self, name_or_id: str, by_id: bool = False,
             max_age: Optional[float] = None) -> Device:
@@ -615,8 +682,11 @@ class RokuSmartHome:
         DeviceNotFound if nothing matches, or if several devices share the name."""
         wanted = _text(name_or_id).strip()
         key = wanted.lower()
-        matches = [d for d in self.devices(max_age)
-                   if (d.id == wanted if by_id else d.name.strip().lower() == key)]
+        for pool in self._lookup_pools(max_age):
+            matches = [d for d in pool
+                       if (d.id == wanted if by_id else d.name.strip().lower() == key)]
+            if matches:
+                break
         if len(matches) == 1:
             return matches[0]
         if matches and by_id:
@@ -630,21 +700,25 @@ class RokuSmartHome:
     def find(self, query: str, max_age: Optional[float] = None) -> Device:
         """Forgiving lookup for people typing names: an exact name (any case),
         then a device id, then any device whose name contains `query`, as long
-        as only one does. Raises DeviceNotFound listing the candidates."""
-        devices = self.devices(max_age)
+        as only one does. Each test looks at the top-level entries before the
+        devices in groups. Raises DeviceNotFound listing the candidates."""
+        pools = self._lookup_pools(max_age)
         query = _text(query).strip()
         if not query:
             raise DeviceNotFound("no device name given")
         q = query.lower()
-        for match in ([d for d in devices if d.name.strip().lower() == q],
-                      [d for d in devices if d.id == query],
-                      [d for d in devices if q in d.name.lower()]):
-            if len(match) == 1:
-                return match[0]
-            if len(match) > 1:
-                names = ", ".join(repr(d.name) for d in match)
-                raise DeviceNotFound(f"{query!r} matches several devices: {names}")
-        names = ", ".join(repr(d.name) for d in devices) or "none"
+        tests = (lambda d: d.name.strip().lower() == q,
+                 lambda d: d.id == query,
+                 lambda d: q in d.name.lower())
+        for test in tests:
+            for pool in pools:
+                match = [d for d in pool if test(d)]
+                if len(match) == 1:
+                    return match[0]
+                if len(match) > 1:
+                    names = ", ".join(repr(d.name) for d in match)
+                    raise DeviceNotFound(f"{query!r} matches several devices: {names}")
+        names = ", ".join(repr(d.name) for d in pools[0] + pools[1]) or "none"
         raise DeviceNotFound(f"no device matches {query!r} (devices: {names})")
 
     # ----- websocket loop (one daemon thread, safe to call from anywhere) -----

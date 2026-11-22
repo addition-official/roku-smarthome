@@ -16,6 +16,7 @@ Developed and tested against the **Roku Indoor Smart Plug SE (PS1000X)** and the
 - Turn plugs and bulbs on and off
 - Set bulb brightness (0 to 100) and white color temperature (2700K to 6500K on the tested bulb; values outside 1800K to 6500K are rejected)
 - Set RGB color on color bulbs (confirmed working by a user with a color bulb, see [#1](https://github.com/addition-official/roku-smarthome/issues/1))
+- Control room groups as a whole or each device in them
 - Send any other command a device advertises, via a generic escape hatch
 - Keep itself logged in: Roku renews the session on every request and this client saves the renewed cookie, so the login never expires as long as you use it at least once a year
 
@@ -102,7 +103,21 @@ print(bulb.brightness, bulb.color_temp)
 bulb.send("color", {"colorType": "temperature", "temperature": 4000})
 ```
 
-`Device` attributes: `id`, `name`, `type` (`plug`, `light`, `camera`), `model`, `local_ip`, `power` (`"on"`/`"off"`), `online`, `brightness`, `color_temp`, `color_type`, `color_rgb`, `supported_commands`, and `raw` (the untouched JSON).
+`Device` attributes: `id`, `name`, `type` (`plug`, `light`, `camera`, `group`), `model`, `local_ip`, `power` (`"on"`/`"off"`), `online`, `brightness`, `color_temp`, `color_type`, `color_rgb`, `supported_commands`, `is_group`, `members` (a group's devices), `group_id` (the group a device is in, or `None`), and `raw` (the untouched JSON).
+
+### Room groups
+
+Devices you put in a room in the Roku app come back from Roku nested inside that room's group, and `devices()` lists them that way: one entry per group, with the devices in `group.members`. `get()` and `find()` look in groups too (for each kind of match, top-level entries first), so every device can be reached by name:
+
+```python
+room = rk.get("Bedroom")
+room.is_group                     # True
+[m.name for m in room.members]    # ['Lamp 1', 'Lamp 2']
+room.set_brightness(40)           # every lamp in the room
+rk.get("Lamp 1").turn_off()       # just one; its group_id is the room's id
+```
+
+A group takes the same commands as a device and reports its members' combined state; members follow a group command within a few seconds. `devices(include_members=True)` lists each group followed by the devices in it. A group's `members` show the state from when the group was fetched (also in an `on_change` callback): after a group command, `refresh()` the devices to see their new state.
 
 ### Sending many commands quickly
 
@@ -152,9 +167,9 @@ Roku's sign-in page emails a verification code on every new login, which is why 
 
 ## How it works
 
-- `GET https://my.roku.com/smarthome/api/v1/leaves` returns every device ("leaf") with its current state.
+- `GET https://my.roku.com/smarthome/api/v1/leaves` returns every device ("leaf") with its current state. A room is one leaf of type `group`, with its devices nested in `memberLeaves`.
 - Commands go over a websocket at `wss://aspen-sockets.aspen.msc.roku.com/v1/socket` as
-  `{"id": ..., "type": "send_command", "payload": {"leafId": ..., "leafType": "device", "command": {"command": ..., "parameters": {...}}}}`.
+  `{"id": ..., "type": "send_command", "payload": {"leafId": ..., "leafType": "device" (or "group"), "command": {"command": ..., "parameters": {...}}}}`.
 - Known commands: `power {"power": "on"|"off"}`, `brightness {"level": 0-100}`, `color {"colorType": "temperature", "temperature": K}`, `color {"colorType": "rgb", "rgb": [r, g, b]}`.
 - Authentication is the `ks.session` cookie from the browser, sent on both the REST call and the websocket handshake.
 

@@ -4,7 +4,16 @@ What changed in each release on [PyPI](https://pypi.org/project/roku-smarthome/)
 
 ## Unreleased
 
-Nothing yet.
+### Fixed
+- Devices in a room group couldn't be found or controlled. Roku returns a room as one `group` leaf with its devices nested inside it, and only the top-level list was searched. `get()` and `find()` now look in groups too: each kind of match (exact name, id, part of a name) checks the top-level entries before the devices in groups, so a device's exact name finds it even when a group's name contains it.
+
+### Added
+- `Device.is_group`, `Device.members` (a group's devices) and `Device.group_id` (the group a device is in). A group's `type` is `"group"` (it was empty).
+- `devices(include_members=True)`: each group followed by the devices in it.
+- `status` shows each group's devices indented under it.
+
+### Known gap
+- Live updates (`on_change`, `watch`) still don't report changes to a device in a group: Roku's socket sends only the group's combined state for it. A follow-up will re-fetch members after a group's report.
 
 ## 0.3.2
 
