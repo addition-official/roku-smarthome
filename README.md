@@ -107,7 +107,7 @@ bulb.send("color", {"colorType": "temperature", "temperature": 4000})
 
 ### Room groups
 
-Devices you put in a room in the Roku app come back from Roku nested inside that room's group, and `devices()` lists them that way: one entry per group, with the devices in `group.members`. `get()` and `find()` look in groups too (for each kind of match, top-level entries first), so every device can be reached by name:
+Devices you put in a room in the Roku app come back from Roku nested inside that room's group, and `devices()` lists them that way: one entry per group, with the devices in `group.members`. `get()` and `find()` look in groups too, so every device can be reached by name. An exact name beats a partial one wherever it is, and they never guess: if two devices match the same way (one in a group and one not, for example), you get an error listing both.
 
 ```python
 room = rk.get("Bedroom")

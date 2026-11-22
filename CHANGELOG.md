@@ -5,7 +5,7 @@ What changed in each release on [PyPI](https://pypi.org/project/roku-smarthome/)
 ## Unreleased
 
 ### Fixed
-- Devices in a room group couldn't be found or controlled. Roku returns a room as one `group` leaf with its devices nested inside it, and only the top-level list was searched. `get()` and `find()` now look in groups too: each kind of match (exact name, id, part of a name) checks the top-level entries before the devices in groups, so a device's exact name finds it even when a group's name contains it.
+- Devices in a room group couldn't be found or controlled. Roku returns a room as one `group` leaf with its devices nested inside it, and only the top-level list was searched. `get()` and `find()` now look in groups too. An exact name beats a partial one wherever it is, so a device's exact name finds it even when a group's name contains it, and neither guesses between two devices that match the same way.
 
 ### Added
 - `Device.is_group`, `Device.members` (a group's devices) and `Device.group_id` (the group a device is in). A group's `type` is `"group"` (it was empty).

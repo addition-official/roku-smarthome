@@ -79,6 +79,9 @@ def test_reconnect_backs_off_when_server_keeps_dropping(rk, server):
 
 
 @pytest.mark.skipif(not hasattr(os, "fork"), reason="needs fork")
+@pytest.mark.skipif(sys.platform == "darwin",
+                    reason="forking a multi-threaded process is unreliable on macOS "
+                           "(the system frameworks can deadlock the child)")
 @pytest.mark.filterwarnings("ignore:This process .* is multi-threaded")
 def test_forked_child_does_not_hang(rk, server):
     rk.find("plug").turn_on()          # parent has a running loop and socket

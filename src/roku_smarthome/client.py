@@ -669,24 +669,15 @@ class RokuSmartHome:
             return [Device(self, r) for r in _leaves(raw)]
         return [Device(self, r, group_id=g) for r, g in _flatten_leaves(raw)]
 
-    def _lookup_pools(self, max_age: Optional[float]) -> List[List[Device]]:
-        """Where get() and find() look, in order: the top-level entries, then
-        the devices in groups."""
-        devices = self.devices(max_age, include_members=True)
-        return [[d for d in devices if d.group_id is None],
-                [d for d in devices if d.group_id is not None]]
-
     def get(self, name_or_id: str, by_id: bool = False,
             max_age: Optional[float] = None) -> Device:
-        """Exact lookup by name (any case) or, with by_id=True, by id. Raises
-        DeviceNotFound if nothing matches, or if several devices share the name."""
+        """Exact lookup by name (any case) or, with by_id=True, by id. Looks at
+        the devices in groups too. Raises DeviceNotFound if nothing matches, or
+        if several devices share the name (wherever they are: it never guesses)."""
         wanted = _text(name_or_id).strip()
         key = wanted.lower()
-        for pool in self._lookup_pools(max_age):
-            matches = [d for d in pool
-                       if (d.id == wanted if by_id else d.name.strip().lower() == key)]
-            if matches:
-                break
+        matches = [d for d in self.devices(max_age, include_members=True)
+                   if (d.id == wanted if by_id else d.name.strip().lower() == key)]
         if len(matches) == 1:
             return matches[0]
         if matches and by_id:
@@ -700,25 +691,23 @@ class RokuSmartHome:
     def find(self, query: str, max_age: Optional[float] = None) -> Device:
         """Forgiving lookup for people typing names: an exact name (any case),
         then a device id, then any device whose name contains `query`, as long
-        as only one does. Each test looks at the top-level entries before the
-        devices in groups. Raises DeviceNotFound listing the candidates."""
-        pools = self._lookup_pools(max_age)
+        as only one does. Looks at the devices in groups too; an exact name
+        beats a partial one wherever it is, and it never guesses between two
+        matches of the same kind. Raises DeviceNotFound listing the candidates."""
+        devices = self.devices(max_age, include_members=True)
         query = _text(query).strip()
         if not query:
             raise DeviceNotFound("no device name given")
         q = query.lower()
-        tests = (lambda d: d.name.strip().lower() == q,
-                 lambda d: d.id == query,
-                 lambda d: q in d.name.lower())
-        for test in tests:
-            for pool in pools:
-                match = [d for d in pool if test(d)]
-                if len(match) == 1:
-                    return match[0]
-                if len(match) > 1:
-                    names = ", ".join(repr(d.name) for d in match)
-                    raise DeviceNotFound(f"{query!r} matches several devices: {names}")
-        names = ", ".join(repr(d.name) for d in pools[0] + pools[1]) or "none"
+        for match in ([d for d in devices if d.name.strip().lower() == q],
+                      [d for d in devices if d.id == query],
+                      [d for d in devices if q in d.name.lower()]):
+            if len(match) == 1:
+                return match[0]
+            if len(match) > 1:
+                names = ", ".join(repr(d.name) for d in match)
+                raise DeviceNotFound(f"{query!r} matches several devices: {names}")
+        names = ", ".join(repr(d.name) for d in devices) or "none"
         raise DeviceNotFound(f"no device matches {query!r} (devices: {names})")
 
     # ----- websocket loop (one daemon thread, safe to call from anywhere) -----

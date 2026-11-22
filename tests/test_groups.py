@@ -108,13 +108,27 @@ def test_devices_in_groups_can_be_looked_up(grouped):
     assert grouped.find("2").id == "lamp-2"  # "Lamp 2" is the only name with a 2
 
 
-def test_a_top_level_entry_still_wins(client):
-    # what a name found before devices in groups were searched, it still finds
+def test_lookups_never_guess_between_a_top_level_device_and_one_in_a_group(client):
+    # get() refuses to guess between devices with the same name, and find()
+    # between two partial matches, wherever they are
     client.fake_leaves = [lamp(9, name="Porch Light"),
                           make_group(lamp(1, name="Porch Lamp"), lamp(2, name="Porch Light"))]
-    assert client.find("porch").id == "lamp-9"
-    assert client.get("porch light").id == "lamp-9"
-    assert client.find("lamp").id == "lamp-1"
+    with pytest.raises(DeviceNotFound, match="several devices are named"):
+        client.get("porch light")
+    with pytest.raises(DeviceNotFound, match="several"):
+        client.find("porch light")
+    with pytest.raises(DeviceNotFound, match="several"):
+        client.find("porch")
+    assert client.find("lamp").id == "lamp-1"          # the only partial match
+    assert client.get("lamp-9", by_id=True).name == "Porch Light"
+
+
+def test_a_partial_match_at_the_top_does_not_hide_one_in_a_group(client):
+    client.fake_leaves = [lamp(9, name="Bedside Plug"),
+                          make_group(lamp(1, name="Bed Lamp"), name="Upstairs")]
+    with pytest.raises(DeviceNotFound) as exc:
+        client.find("bed")
+    assert "Bedside Plug" in str(exc.value) and "Bed Lamp" in str(exc.value)
 
 
 def test_an_exact_name_in_a_group_beats_a_partial_one_at_the_top(client):
